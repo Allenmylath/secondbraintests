@@ -1,238 +1,196 @@
+import graphblas as gb
 import numpy as np
-import hashlib
-from python_graphblas import Matrix, Vector, INT64, select, binary, monoid
-import python_graphblas as gb
+import json
 
-def url_to_hash(url):
-    """Convert URL to consistent 64-bit hash"""
-    return int(hashlib.blake2b(url.encode(), digest_size=8).hexdigest(), 16)
-
-def create_test_matrices():
-    """Create test Day1 and Day2 matrices as sparse GraphBLAS matrices"""
+def create_demo_matrices():
+    """Create demo input matrices for testing"""
     
-    # Test URLs
-    day1_data = [
-        {
-            "main_url": "https://site1.com/page1",
-            "images": ["https://site1.com/img1.jpg", "https://site1.com/img2.png"]
-        },
-        {
-            "main_url": "https://site2.com/page1", 
-            "images": ["https://site2.com/img1.jpg", "https://site2.com/img2.jpg", "https://site2.com/img3.png"]
-        },
-        {
-            "main_url": "https://site3.com/page1",
-            "images": ["https://site3.com/img1.jpg"]
-        },
-        {
-            "main_url": "https://site4.com/page1",  # This will be removed (not in day2)
-            "images": ["https://site4.com/img1.jpg", "https://site4.com/img2.jpg"]
-        },
-        {
-            "main_url": "https://site5.com/page1",  # This will be removed (not in day2)
-            "images": ["https://site5.com/img1.jpg"]
-        }
+    # Today's Matrix (3 houses)
+    # Row 1: house_A with img1, img2, img3
+    # Row 2: house_B with img4, img5  
+    # Row 3: house_C with img6, img7, img8, img9
+    today_data = [
+        [1001, 2001, 2002, 2003, 0, 0, 0],  # house_A: 1001, images: 2001,2002,2003
+        [1002, 2004, 2005, 0, 0, 0, 0],     # house_B: 1002, images: 2004,2005
+        [1003, 2006, 2007, 2008, 2009, 0, 0] # house_C: 1003, images: 2006,2007,2008,2009
     ]
     
-    day2_data = [
-        {
-            "main_url": "https://site1.com/page1",  # Same as day1
-            "images": ["https://site1.com/img1.jpg", "https://site1.com/img3.png"]  # img2 gone, img3 new
-        },
-        {
-            "main_url": "https://site2.com/page1",  # Same as day1
-            "images": ["https://site2.com/img1.jpg", "https://site2.com/img2.jpg", "https://site2.com/img4.png"]  # img4 new
-        },
-        {
-            "main_url": "https://site3.com/page1",  # Same as day1
-            "images": ["https://site3.com/img1.jpg", "https://site3.com/img2.jpg", "https://site3.com/img3.jpg"]  # 2 new images
-        },
-        {
-            "main_url": "https://site6.com/page1",  # New site (won't affect day1)
-            "images": ["https://site6.com/img1.jpg"]
-        },
-        {
-            "main_url": "https://site7.com/page1",  # New site (won't affect day1)
-            "images": ["https://site7.com/img1.jpg", "https://site7.com/img2.jpg"]
-        }
+    # Yesterday's Matrix (3 houses)  
+    # Row 1: house_A with img1, img2, img3 (SAME as today)
+    # Row 2: house_D with img10, img11 (DIFFERENT house)
+    # Row 3: house_C with img6, img12 (DIFFERENT images)
+    yesterday_data = [
+        [1001, 2001, 2002, 2003, 0, 0, 0],  # house_A: same images
+        [1004, 2010, 2011, 0, 0, 0, 0],     # house_D: different house  
+        [1003, 2006, 2012, 0, 0, 0, 0]      # house_C: different images (2012 instead of 2007,2008,2009)
     ]
     
-    # Convert to GraphBLAS sparse matrices directly
-    day1_matrix = create_sparse_matrix(day1_data)
-    day2_matrix = create_sparse_matrix(day2_data)
+    # Convert to GraphBLAS matrices
+    today_matrix = gb.Matrix.from_dense(np.array(today_data, dtype=np.int64))
+    yesterday_matrix = gb.Matrix.from_dense(np.array(yesterday_data, dtype=np.int64))
     
-    return day1_matrix, day2_matrix, day1_data, day2_data
+    return today_matrix, yesterday_matrix
 
-def create_sparse_matrix(data):
-    """Create GraphBLAS sparse matrix directly from URL data"""
-    nrows = len(data)
-    ncols = 101
-    
-    # Create empty sparse matrix
-    matrix = Matrix(INT64, nrows=nrows, ncols=ncols)
-    
-    for i, page in enumerate(data):
-        # Set main URL hash at column 0
-        main_hash = url_to_hash(page["main_url"])
-        matrix[i, 0] = main_hash
-        
-        # Set image URL hashes at columns 1-100
-        for j, img_url in enumerate(page["images"][:100]):
-            img_hash = url_to_hash(img_url)
-            matrix[i, j + 1] = img_hash
-    
-    return matrix
+def arrays_equal(arr1, arr2):
+    """Check if two image arrays are identical"""
+    return np.array_equal(arr1, arr2)
 
-def sync_matrices_pure_graphblas(day1_matrix, day2_matrix):
-    """Synchronize matrices using pure GraphBLAS operations"""
+def merge_image_arrays(today_imgs, yesterday_imgs):
+    """Merge image arrays, keeping unique images up to 100"""
+    # Convert to sets to remove duplicates, then back to list
+    today_set = set(img for img in today_imgs if img != 0)
+    yesterday_set = set(img for img in yesterday_imgs if img != 0)
     
-    print("=== Pure GraphBLAS Synchronization ===")
-    print(f"Day1 matrix: {day1_matrix.shape}, {day1_matrix.nvals} non-zeros")
-    print(f"Day2 matrix: {day2_matrix.shape}, {day2_matrix.nvals} non-zeros")
+    merged_set = today_set | yesterday_set  # Union
+    merged_list = list(merged_set)[:100]  # Limit to 100
     
-    # Step 1: Extract main URL columns (column 0) as vectors
-    day1_main_urls = day1_matrix[:, 0]  # Vector of main URLs from day1
-    day2_main_urls = day2_matrix[:, 0]  # Vector of main URLs from day2
+    # Pad with zeros to make same length as original
+    original_length = len(today_imgs)
+    while len(merged_list) < original_length:
+        merged_list.append(0)
     
-    print(f"Day1 main URLs: {day1_main_urls.nvals} entries")
-    print(f"Day2 main URLs: {day2_main_urls.nvals} entries")
+    return merged_list
+
+def find_changed_houses(today_matrix, yesterday_matrix):
+    """
+    Returns a matrix with only new houses or houses with changed images
+    """
+    print("Processing matrices...")
+    print(f"Today matrix shape: {today_matrix.shape}")
+    print(f"Yesterday matrix shape: {yesterday_matrix.shape}")
     
-    # Step 2: Find intersection of main URLs using GraphBLAS operations
-    # Create a "lookup" matrix where rows=day1_indices, cols=url_hashes, values=1
-    day1_lookup = Matrix(INT64, nrows=day1_matrix.nrows, ncols=1)
-    day2_url_set = set()
+    # Extract main URL columns (column 0)
+    today_main_urls = today_matrix[:, 0]
+    yesterday_main_urls = yesterday_matrix[:, 0]
     
-    # Get day2 URL values efficiently
-    day2_indices, day2_values = day2_main_urls.to_coo()
-    for idx, val in zip(day2_indices, day2_values):
-        day2_url_set.add(val)
+    print(f"\nToday's house hashes: {today_main_urls.to_dense()}")
+    print(f"Yesterday's house hashes: {yesterday_main_urls.to_dense()}")
     
-    # Find day1 rows that have URLs also present in day2
-    day1_indices, day1_values = day1_main_urls.to_coo()
-    rows_to_keep = []
-    day1_to_day2_mapping = {}
+    changed_rows = []
     
-    for d1_idx, d1_val in zip(day1_indices, day1_values):
-        if d1_val in day2_url_set:
-            rows_to_keep.append(d1_idx)
-            # Find corresponding day2 row
-            for d2_idx, d2_val in zip(day2_indices, day2_values):
-                if d2_val == d1_val:
-                    day1_to_day2_mapping[d1_idx] = d2_idx
-                    break
-    
-    print(f"Rows to keep: {len(rows_to_keep)}")
-    print(f"Rows to remove: {day1_matrix.nrows - len(rows_to_keep)}")
-    
-    if not rows_to_keep:
-        # Return empty matrix
-        return Matrix(INT64, nrows=0, ncols=101)
-    
-    # Step 3: Build synchronized matrix using GraphBLAS extract and assign
-    synchronized_matrix = Matrix(INT64, nrows=len(rows_to_keep), ncols=101)
-    
-    for new_row_idx, old_day1_row in enumerate(rows_to_keep):
-        day2_row = day1_to_day2_mapping[old_day1_row]
+    # Process each house in today's matrix
+    for i in range(today_matrix.nrows):
+        today_house_hash = today_main_urls[i].value if today_main_urls[i].value else 0
+        if today_house_hash == 0:  # Skip empty rows
+            continue
+            
+        print(f"\nProcessing house {today_house_hash}...")
         
-        # Extract image columns (1:100) from both matrices using GraphBLAS
-        day1_images = day1_matrix[old_day1_row, 1:]  # Columns 1-100
-        day2_images = day2_matrix[day2_row, 1:]      # Columns 1-100
+        # Check if this house existed yesterday
+        found_yesterday_row = None
+        for j in range(yesterday_matrix.nrows):
+            yesterday_house_hash = yesterday_main_urls[j].value if yesterday_main_urls[j].value else 0
+            if yesterday_house_hash == today_house_hash:
+                found_yesterday_row = j
+                break
         
-        # Get non-zero image hashes using GraphBLAS operations
-        day1_img_indices, day1_img_values = day1_images.to_coo()
-        day2_img_indices, day2_img_values = day2_images.to_coo()
-        
-        # Union of images: combine day1 and day2 image sets
-        all_images = set(day1_img_values) | set(day2_img_values)
-        
-        # Set main URL in synchronized matrix
-        main_url_hash = day1_matrix[old_day1_row, 0].get(0)
-        synchronized_matrix[new_row_idx, 0] = main_url_hash
-        
-        # Add union of images if within limit
-        if len(all_images) <= 100:
-            for col_idx, img_hash in enumerate(sorted(all_images)):
-                if col_idx < 100:
-                    synchronized_matrix[new_row_idx, col_idx + 1] = img_hash
+        if found_yesterday_row is None:
+            # NEW HOUSE: Take entire row from today
+            print(f"  → NEW HOUSE: {today_house_hash}")
+            today_row = today_matrix[i, :].to_dense()
+            changed_rows.append(today_row)
+            
         else:
-            # Keep only day1 images (ignore union)
-            for col_idx, img_hash in zip(day1_img_indices, day1_img_values):
-                synchronized_matrix[new_row_idx, col_idx + 1] = img_hash
+            # EXISTING HOUSE: Check if images changed
+            print(f"  → EXISTING HOUSE: {today_house_hash}, checking images...")
+            today_images = today_matrix[i, 1:].to_dense()  # Columns 1 onwards
+            yesterday_images = yesterday_matrix[found_yesterday_row, 1:].to_dense()
+            
+            print(f"    Today's images: {today_images}")
+            print(f"    Yesterday's images: {yesterday_images}")
+            
+            # Compare image arrays
+            if not arrays_equal(today_images, yesterday_images):
+                print("    → IMAGES CHANGED: merging...")
+                # Images changed: merge today + yesterday images
+                merged_images = merge_image_arrays(today_images, yesterday_images)
+                merged_row = [today_house_hash] + merged_images
+                print(f"    → Merged images: {merged_images}")
+                changed_rows.append(merged_row)
+            else:
+                print("    → IMAGES SAME: skipping...")
     
-    return synchronized_matrix
+    # Convert to GraphBLAS matrix
+    if changed_rows:
+        print(f"\nFinal changed rows: {len(changed_rows)}")
+        for i, row in enumerate(changed_rows):
+            print(f"  Row {i+1}: {row}")
+        result_matrix = gb.Matrix.from_dense(np.array(changed_rows, dtype=np.int64))
+        return result_matrix
+    else:
+        # Return empty matrix
+        print("\nNo changes found!")
+        return gb.Matrix.sparse(gb.dtypes.INT64, 0, today_matrix.ncols)
 
-def analyze_matrix_graphblas(matrix, name):
-    """Analyze matrix using GraphBLAS operations"""
-    print(f"\n=== {name} Analysis ===")
-    print(f"Shape: {matrix.shape}")
-    print(f"Non-zero elements: {matrix.nvals}")
-    print(f"Density: {matrix.nvals / (matrix.nrows * matrix.ncols) * 100:.2f}%")
+def demo_keyval_conversion(changes_matrix):
+    """Demo conversion using mock keyval JSON"""
     
-    if matrix.nrows > 0:
-        # Use GraphBLAS to find statistics
-        main_urls = matrix[:, 0]  # Column 0
-        print(f"Main URLs (non-zero): {main_urls.nvals}")
+    # Mock keyval mappings
+    main_keyval = {
+        "1001": "https://remax.ca/house_A",
+        "1002": "https://remax.ca/house_B", 
+        "1003": "https://remax.ca/house_C",
+        "1004": "https://remax.ca/house_D"
+    }
+    
+    image_keyval = {
+        "2001": "img1.jpg",
+        "2002": "img2.jpg", 
+        "2003": "img3.jpg",
+        "2004": "img4.jpg",
+        "2005": "img5.jpg",
+        "2006": "img6.jpg",
+        "2007": "img7.jpg",
+        "2008": "img8.jpg",
+        "2009": "img9.jpg",
+        "2010": "img10.jpg",
+        "2011": "img11.jpg",
+        "2012": "img12.jpg"
+    }
+    
+    final_json = {}
+    
+    print("\nConverting to actual URLs...")
+    for i in range(changes_matrix.nrows):
+        row_data = changes_matrix[i, :].to_dense()
+        main_url_hash = str(int(row_data[0]))
+        image_hashes = [str(int(img)) for img in row_data[1:] if img != 0]
         
-        # Count images per row using GraphBLAS reduce
-        images_section = matrix[:, 1:]  # Columns 1-100
+        main_url = main_keyval.get(main_url_hash)
+        image_urls = [image_keyval.get(h) for h in image_hashes if image_keyval.get(h)]
         
-        # For each row, count non-zero elements (images)
-        for row in range(min(matrix.nrows, 5)):  # Show first 5 rows
-            row_images = matrix[row, 1:]
-            img_count = row_images.nvals
-            main_url_hash = matrix[row, 0].get(0) if matrix[row, 0].nvals > 0 else 0
-            print(f"  Row {row}: URL hash {main_url_hash}, {img_count} images")
+        if main_url:
+            final_json[main_url] = image_urls
+            print(f"  {main_url}: {image_urls}")
+    
+    return final_json
 
-def demonstrate_graphblas_efficiency():
-    """Show GraphBLAS efficiency benefits"""
-    print("\n=== GraphBLAS Efficiency Demonstration ===")
-    
-    # Create larger test case
-    large_day1 = Matrix(INT64, nrows=1000, ncols=101)
-    large_day2 = Matrix(INT64, nrows=800, ncols=101)
-    
-    # Populate with sparse data (only ~10% filled)
-    import random
-    random.seed(42)
-    
-    for i in range(1000):
-        large_day1[i, 0] = hash(f"url_{i}")  # Main URL
-        for j in range(random.randint(1, 10)):  # 1-10 images per page
-            large_day1[i, j + 1] = hash(f"img_{i}_{j}")
-    
-    for i in range(800):
-        large_day2[i, 0] = hash(f"url_{i}")  # Main URL  
-        for j in range(random.randint(1, 12)):  # 1-12 images per page
-            large_day2[i, j + 1] = hash(f"img_{i}_{j}_{random.randint(1,3)}")
-    
-    print(f"Large Day1: {large_day1.shape}, {large_day1.nvals} non-zeros")
-    print(f"Large Day2: {large_day2.shape}, {large_day2.nvals} non-zeros")
-    print(f"Day1 density: {large_day1.nvals / (large_day1.nrows * large_day1.ncols) * 100:.2f}%")
-    
-    # This would be much faster with pure GraphBLAS vs dense operations
-    print("GraphBLAS operations work efficiently on sparse data!")
-
-# Test the pure GraphBLAS implementation
+# Run the demo
 if __name__ == "__main__":
-    # Create test matrices
-    day1_matrix, day2_matrix, day1_data, day2_data = create_test_matrices()
+    print("=== GraphBLAS Real Estate Demo ===\n")
     
-    # Analyze original matrices
-    analyze_matrix_graphblas(day1_matrix, "Day1")
-    analyze_matrix_graphblas(day2_matrix, "Day2")
+    # Create demo matrices
+    today_matrix, yesterday_matrix = create_demo_matrices()
     
-    # Synchronize using pure GraphBLAS
-    synchronized_matrix = sync_matrices_pure_graphblas(day1_matrix, day2_matrix)
+    print("Today's Matrix:")
+    print(today_matrix.to_dense())
+    print("\nYesterday's Matrix:")  
+    print(yesterday_matrix.to_dense())
+    print("\n" + "="*50)
     
-    # Analyze result
-    analyze_matrix_graphblas(synchronized_matrix, "Synchronized")
+    # Find changed houses
+    changes_matrix = find_changed_houses(today_matrix, yesterday_matrix)
     
-    # Show expected results
-    print("\n=== Expected Results ===")
-    print("✓ 3 rows remaining (site1, site2, site3)")
-    print("✓ site4 and site5 removed (not in day2)")
-    print("✓ New images added where capacity allows")
-    print("✓ All operations done with sparse GraphBLAS matrices")
+    print("\n" + "="*50)
+    print("Final Changes Matrix:")
+    if changes_matrix.nrows > 0:
+        print(changes_matrix.to_dense())
+    else:
+        print("(empty)")
     
-    # Demonstrate efficiency on larger data
-    demonstrate_graphblas_efficiency()
+    # Convert to final JSON
+    print("\n" + "="*50)
+    final_result = demo_keyval_conversion(changes_matrix)
+    
+    print(f"\nFinal JSON Output:")
+    print(json.dumps(final_result, indent=2))
