@@ -1,5 +1,6 @@
 import json
-import requests
+import asyncio
+import aiohttp
 import hashlib
 from datetime import datetime
 from typing import Dict, List, Tuple, Any
@@ -38,25 +39,28 @@ class RealEstateMatrixComparator:
             return datetime.strptime(date_str, "%Y%m%d_%H%M%S")
         raise ValueError(f"Cannot extract date from filename: {filename}")
 
-    def fetch_s3_data(self, url: str) -> Dict[str, Any]:
-        """Fetch JSON data from S3 URL"""
-        print(f"📥 Downloading data from: {url}")
+    async def fetch_s3_data(
+        self, session: aiohttp.ClientSession, url: str
+    ) -> Dict[str, Any]:
+        """Fetch JSON data from S3 URL asynchronously"""
+        print(f"📥 Starting download from: {url}")
         start_time = time.time()
 
         try:
-            response = requests.get(url)
-            response.raise_for_status()
-            data = response.json()
+            async with session.get(url) as response:
+                response.raise_for_status()
+                content = await response.read()
+                data = json.loads(content)
 
-            download_time = time.time() - start_time
-            data_size_mb = len(response.content) / (1024 * 1024)
+                download_time = time.time() - start_time
+                data_size_mb = len(content) / (1024 * 1024)
 
-            print(
-                f"✅ Download completed: {data_size_mb:.2f} MB in {download_time:.2f}s ({data_size_mb/download_time:.2f} MB/s)"
-            )
-            print(f"📊 Properties found: {len(data)}")
+                print(
+                    f"✅ Download completed: {data_size_mb:.2f} MB in {download_time:.2f}s ({data_size_mb/download_time:.2f} MB/s)"
+                )
+                print(f"📊 Properties found: {len(data)}")
 
-            return data
+                return data
 
         except Exception as e:
             print(f"❌ Error downloading from {url}: {e}")
@@ -257,7 +261,7 @@ class RealEstateMatrixComparator:
 
         return new_updated_properties, removed_properties
 
-    def process_comparison(self, url1: str, url2: str) -> Dict[str, Any]:
+    async def process_comparison(self, url1: str, url2: str) -> Dict[str, Any]:
         """
         Main method to process comparison between two S3 URLs
         Returns final JSON with new/updated properties AND removed properties
@@ -274,13 +278,17 @@ class RealEstateMatrixComparator:
         print(f"📄 Earlier file: {earlier_url.split('/')[-1]}")
         print()
 
-        # Download data
-        print("🌐 Downloading data from S3...")
-        latest_data = self.fetch_s3_data(latest_url)
+        # Download data asynchronously
+        print("🌐 Downloading data from S3 (parallel downloads)...")
+        async with aiohttp.ClientSession() as session:
+            latest_task = asyncio.create_task(self.fetch_s3_data(session, latest_url))
+            earlier_task = asyncio.create_task(self.fetch_s3_data(session, earlier_url))
+
+            latest_data, earlier_data = await asyncio.gather(latest_task, earlier_task)
+
         if not latest_data:
             return {"error": "No latest data available"}
 
-        earlier_data = self.fetch_s3_data(earlier_url)
         print()
 
         # Create matrices
@@ -345,7 +353,7 @@ class RealEstateMatrixComparator:
         return result
 
 
-def main():
+async def main():
     """Example usage of the RealEstateMatrixComparator"""
 
     print("🏠 Real Estate Data Comparator")
@@ -358,7 +366,7 @@ def main():
     url2 = "https://secondbrainscrape.s3.us-east-1.amazonaws.com/20250626_020103.json"
 
     comparator = RealEstateMatrixComparator(base_s3_url)
-    result = comparator.process_comparison(url1, url2)
+    result = await comparator.process_comparison(url1, url2)
 
     if "error" in result:
         print(f"❌ Error: {result['error']}")
@@ -394,4 +402,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
