@@ -3,7 +3,7 @@ import asyncio
 import aiohttp
 import hashlib
 from datetime import datetime
-from typing import Dict, List, Tuple, Any, Set
+from typing import Dict, List, Tuple, Any
 import graphblas as gb
 from urllib.parse import urlparse
 import re
@@ -19,18 +19,20 @@ class RealEstateMatrixComparator:
         self.base_s3_url = base_s3_url
         self.hash_to_url = {}  # BLAKE hash -> original URL mapping
         self.url_to_hash = {}  # original URL -> BLAKE hash mapping
-        self.global_hash_registry = set()  # Track all unique hashes across datasets
 
-    def blake_hash(self, url: str) -> str:
-        """Generate BLAKE2b hash for URL"""
-        return hashlib.blake2b(url.encode("utf-8")).hexdigest()
+    def blake_hash(self, url: str) -> int:
+        """Generate BLAKE2b hash for URL that fits in GraphBLAS UINT64"""
+        # Use digest_size=8 to get exactly 8 bytes (64 bits)
+        hash_bytes = hashlib.blake2b(url.encode("utf-8"), digest_size=8).digest()
+        hash_int = int.from_bytes(hash_bytes, byteorder='big')
+        # Ensure it fits in signed 64-bit range to avoid overflow
+        return hash_int & 0x7FFFFFFFFFFFFFFF
 
-    def add_url_mapping(self, url: str) -> str:
+    def add_url_mapping(self, url: str) -> int:
         """Add URL to hash mapping and return hash"""
         url_hash = self.blake_hash(url)
         self.hash_to_url[url_hash] = url
         self.url_to_hash[url] = url_hash
-        self.global_hash_registry.add(url_hash)
         return url_hash
 
     def extract_date_from_filename(self, filename: str) -> datetime:
@@ -85,70 +87,20 @@ class RealEstateMatrixComparator:
         except Exception:
             return url1, url2
 
-    def build_global_hash_index(self, latest_data: Dict, earlier_data: Dict) -> Tuple[Dict[str, int], List[str]]:
+    def create_hash_matrix(
+        self, data: Dict[str, Any], dataset_name: str = ""
+    ) -> Tuple[gb.Matrix, List[int], Dict[int, Dict[str, Any]]]:
         """
-        Build a global hash index that encompasses all unique hashes from both datasets
-        Returns: (hash_to_col_mapping, col_to_hash_mapping)
-        """
-        print("🗂️  Building global hash index...")
-        
-        # Collect all unique hashes from both datasets
-        all_hashes = set()
-        
-        # Process latest data
-        for main_url, property_data in latest_data.items():
-            if not isinstance(property_data, dict) or "images" not in property_data:
-                continue
-            
-            main_url_hash = self.add_url_mapping(main_url)
-            all_hashes.add(main_url_hash)
-            
-            images = property_data.get("images", [])
-            for img_url in images[:100]:
-                if img_url and isinstance(img_url, str) and img_url.strip():
-                    if not any(skip in img_url.lower() for skip in [".svg", "logo", "remax_residential"]):
-                        img_hash = self.add_url_mapping(img_url)
-                        all_hashes.add(img_hash)
-        
-        # Process earlier data
-        for main_url, property_data in earlier_data.items():
-            if not isinstance(property_data, dict) or "images" not in property_data:
-                continue
-            
-            main_url_hash = self.add_url_mapping(main_url)
-            all_hashes.add(main_url_hash)
-            
-            images = property_data.get("images", [])
-            for img_url in images[:100]:
-                if img_url and isinstance(img_url, str) and img_url.strip():
-                    if not any(skip in img_url.lower() for skip in [".svg", "logo", "remax_residential"]):
-                        img_hash = self.add_url_mapping(img_url)
-                        all_hashes.add(img_hash)
-        
-        # Create column mappings
-        sorted_hashes = sorted(list(all_hashes))
-        hash_to_col = {hash_val: idx for idx, hash_val in enumerate(sorted_hashes)}
-        
-        print(f"📋 Global hash index: {len(sorted_hashes)} unique hashes")
-        return hash_to_col, sorted_hashes
-
-    def create_aligned_matrix(
-        self, 
-        data: Dict[str, Any], 
-        hash_to_col: Dict[str, int], 
-        ncols: int,
-        dataset_name: str = ""
-    ) -> Tuple[gb.Matrix, List[str], Dict[int, Dict[str, List[str]]]]:
-        """
-        Create GraphBLAS matrix aligned with global hash index
+        Create GraphBLAS matrix with hash values (not booleans)
+        Matrix structure: [[main_url_hash, img1_hash, img2_hash, ...], ...]
         Returns: (matrix, main_url_hashes, row_details)
         """
-        print(f"🔧 Creating aligned matrix for {dataset_name} dataset...")
+        print(f"🔧 Creating hash-value matrix for {dataset_name} dataset...")
         start_time = time.time()
 
         properties = []
         main_url_hashes = []
-        row_details = {}  # row_idx -> {"main_hash": str, "image_hashes": List[str]}
+        row_details = {}  # row_idx -> {"main_hash": int, "main_url": str, "image_hashes": List[int], "image_urls": List[str]}
         total_images = 0
 
         for main_url, property_data in data.items():
@@ -160,19 +112,27 @@ class RealEstateMatrixComparator:
 
             images = property_data.get("images", [])
             image_hashes = []
+            image_urls = []
 
-            for img_url in images[:100]:
+            for img_url in images[:100]:  # Limit to 100 images
                 if img_url and isinstance(img_url, str) and img_url.strip():
-                    if not any(skip in img_url.lower() for skip in [".svg", "logo", "remax_residential"]):
+                    # Skip SVG logos and other non-photo images
+                    if not any(
+                        skip in img_url.lower()
+                        for skip in [".svg", "logo", "remax_residential"]
+                    ):
                         img_hash = self.add_url_mapping(img_url)
                         image_hashes.append(img_hash)
+                        image_urls.append(img_url)
 
             total_images += len(image_hashes)
             row_idx = len(properties)
             
             row_details[row_idx] = {
                 "main_hash": main_url_hash,
-                "image_hashes": image_hashes
+                "main_url": main_url,
+                "image_hashes": image_hashes,
+                "image_urls": image_urls
             }
 
             properties.append({
@@ -182,23 +142,23 @@ class RealEstateMatrixComparator:
 
         if not properties:
             print(f"⚠️  No valid properties found in {dataset_name}")
-            empty_matrix = gb.Matrix(gb.dtypes.BOOL, nrows=0, ncols=ncols)
+            empty_matrix = gb.Matrix(gb.dtypes.UINT64, nrows=0, ncols=101)
             return empty_matrix, [], {}
 
         nrows = len(properties)
-        matrix = gb.Matrix(gb.dtypes.BOOL, nrows=nrows, ncols=ncols)
+        ncols = 101  # Fixed: 1 main URL + 100 images
 
-        # Fill matrix using global hash index
+        # Create matrix with UINT64 to store hash values
+        matrix = gb.Matrix(gb.dtypes.UINT64, nrows=nrows, ncols=ncols)
+
         for row_idx, prop in enumerate(properties):
-            # Set main URL column
-            main_col = hash_to_col[prop["main_url_hash"]]
-            matrix[row_idx, main_col] = True
+            # Column 0: Main URL hash
+            matrix[row_idx, 0] = prop["main_url_hash"]
 
-            # Set image URL columns
-            for img_hash in prop["image_hashes"]:
-                if img_hash in hash_to_col:
-                    img_col = hash_to_col[img_hash]
-                    matrix[row_idx, img_col] = True
+            # Columns 1-100: Image URL hashes (0 for empty slots)
+            for col_idx, img_hash in enumerate(prop["image_hashes"][:100]):
+                if col_idx < 100:
+                    matrix[row_idx, col_idx + 1] = img_hash
 
         matrix_time = time.time() - start_time
         sparsity = (
@@ -207,26 +167,26 @@ class RealEstateMatrixComparator:
             * 100
         )
 
-        print(f"✅ {dataset_name} aligned matrix: {nrows} rows × {ncols} cols in {matrix_time:.2f}s")
+        print(f"✅ {dataset_name} hash matrix created: {nrows} rows × {ncols} cols in {matrix_time:.2f}s")
         print(f"📈 Sparsity: {sparsity:.1f}% | Images processed: {total_images}")
+        print(f"🔢 Hash values stored: {matrix.nvals:,}")
 
         return matrix, main_url_hashes, row_details
 
-    def compare_matrices_graphblas(
+    def compare_hash_matrices(
         self,
         latest_matrix: gb.Matrix,
-        latest_main_hashes: List[str],
-        latest_row_details: Dict[int, Dict[str, List[str]]],
+        latest_main_hashes: List[int],
+        latest_row_details: Dict[int, Dict[str, Any]],
         earlier_matrix: gb.Matrix,
-        earlier_main_hashes: List[str],
-        earlier_row_details: Dict[int, Dict[str, List[str]]],
-        hash_to_col: Dict[str, int],
-        col_to_hash: List[str]
+        earlier_main_hashes: List[int],
+        earlier_row_details: Dict[int, Dict[str, Any]]
     ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
         """
-        Compare matrices using GraphBLAS operations instead of set operations
+        Compare hash-value matrices using GraphBLAS operations
+        Direct hash comparison in matrices
         """
-        print("🔍 Comparing matrices using GraphBLAS operations...")
+        print("🔍 Comparing hash-value matrices using GraphBLAS...")
         start_time = time.time()
 
         new_updated_properties = {}
@@ -240,108 +200,106 @@ class RealEstateMatrixComparator:
         latest_main_set = set(latest_main_hashes)
         earlier_main_set = set(earlier_main_hashes)
 
+        new_count = 0
+        updated_count = 0
+        removed_count = 0
+
+        print(f"📊 Dataset sizes: Latest={len(latest_main_set)}, Earlier={len(earlier_main_set)}")
+
         # 1. Find completely new properties (in latest but not in earlier)
         new_properties = latest_main_set - earlier_main_set
+        print(f"🆕 Found {len(new_properties)} completely new properties")
+        
         for main_hash in new_properties:
-            main_url = self.hash_to_url[main_hash]
             row_idx = latest_hash_to_row[main_hash]
-            image_hashes = latest_row_details[row_idx]["image_hashes"]
-            image_urls = [self.hash_to_url[h] for h in image_hashes if h in self.hash_to_url]
-            if image_urls:
+            row_data = latest_row_details[row_idx]
+            main_url = row_data["main_url"]
+            image_urls = row_data["image_urls"]
+            
+            if image_urls:  # Only include properties with images
                 new_updated_properties[main_url] = image_urls
+                new_count += 1
 
         # 2. Find removed properties (in earlier but not in latest)
         removed_props = earlier_main_set - latest_main_set
+        print(f"🗑️  Found {len(removed_props)} removed properties")
+        
         for main_hash in removed_props:
-            main_url = self.hash_to_url[main_hash]
             row_idx = earlier_hash_to_row[main_hash]
-            image_hashes = earlier_row_details[row_idx]["image_hashes"]
-            image_urls = [self.hash_to_url[h] for h in image_hashes if h in self.hash_to_url]
+            row_data = earlier_row_details[row_idx]
+            main_url = row_data["main_url"]
+            image_urls = row_data["image_urls"]
+            
             removed_properties[main_url] = image_urls
+            removed_count += 1
 
-        # 3. Find updated properties using GraphBLAS matrix operations
+        # 3. Find updated properties using GraphBLAS hash matrix comparison
         common_properties = latest_main_set & earlier_main_set
+        print(f"🔄 Analyzing {len(common_properties)} common properties with hash matrix comparison...")
         
         if common_properties and earlier_matrix.nrows > 0:
-            print(f"🔄 Analyzing {len(common_properties)} common properties with GraphBLAS...")
-            
             for main_hash in common_properties:
                 latest_row = latest_hash_to_row[main_hash]
                 earlier_row = earlier_hash_to_row[main_hash]
                 
-                # Extract matrix rows as vectors for comparison
                 try:
-                    # Get row vectors from matrices
+                    # Extract matrix rows for direct hash comparison
                     latest_row_vector = latest_matrix[latest_row, :].new()
                     earlier_row_vector = earlier_matrix[earlier_row, :].new()
                     
-                    # Ensure both vectors have same size (pad if needed)
-                    max_cols = max(latest_matrix.ncols, earlier_matrix.ncols)
+                    # Convert to dictionaries for comparison (excluding column 0 - main URL)
+                    latest_hashes = latest_row_vector.to_dict()
+                    earlier_hashes = earlier_row_vector.to_dict()
                     
-                    if latest_matrix.ncols < max_cols:
-                        # Expand latest row vector
-                        temp_latest = gb.Vector(gb.dtypes.BOOL, size=max_cols)
-                        temp_latest[:latest_matrix.ncols] = latest_row_vector
-                        latest_row_vector = temp_latest
+                    # Remove main URL column (column 0) from comparison
+                    latest_image_hashes = {k: v for k, v in latest_hashes.items() if k != 0}
+                    earlier_image_hashes = {k: v for k, v in earlier_hashes.items() if k != 0}
                     
-                    if earlier_matrix.ncols < max_cols:
-                        # Expand earlier row vector  
-                        temp_earlier = gb.Vector(gb.dtypes.BOOL, size=max_cols)
-                        temp_earlier[:earlier_matrix.ncols] = earlier_row_vector
-                        earlier_row_vector = temp_earlier
-                    
-                    # Use GraphBLAS XOR to find differences
-                    diff_vector = latest_row_vector.ewise_add(earlier_row_vector, gb.binary.lxor).new()
-                    
-                    # Check if there are any differences
-                    if diff_vector.nvals > 0:
-                        # Property has changes - get all current images
-                        main_url = self.hash_to_url[main_hash]
-                        
-                        # Get all images from latest (existing + new)
-                        latest_image_hashes = latest_row_details[latest_row]["image_hashes"]
-                        earlier_image_hashes = earlier_row_details[earlier_row]["image_hashes"]
-                        
-                        # Use set operations to find if there are actually new images
-                        latest_img_set = set(latest_image_hashes)
-                        earlier_img_set = set(earlier_image_hashes)
-                        
-                        if latest_img_set != earlier_img_set:
-                            # Combine all images (prioritize latest)
-                            all_image_hashes = list(latest_img_set | earlier_img_set)[:100]
-                            image_urls = [self.hash_to_url[h] for h in all_image_hashes if h in self.hash_to_url]
-                            if image_urls:
-                                new_updated_properties[main_url] = image_urls
-                
-                except Exception as e:
-                    print(f"⚠️  GraphBLAS operation failed for property {main_hash}: {e}")
-                    # Fallback to set-based comparison for this property
-                    main_url = self.hash_to_url[main_hash]
-                    latest_image_hashes = set(latest_row_details[latest_row]["image_hashes"])
-                    earlier_image_hashes = set(earlier_row_details[earlier_row]["image_hashes"])
-                    
+                    # Direct hash comparison - if hash values differ, content differs
                     if latest_image_hashes != earlier_image_hashes:
-                        all_image_hashes = list(latest_image_hashes | earlier_image_hashes)[:100]
-                        image_urls = [self.hash_to_url[h] for h in all_image_hashes if h in self.hash_to_url]
+                        row_data = latest_row_details[latest_row]
+                        main_url = row_data["main_url"]
+                        
+                        # Get all current images from latest dataset
+                        image_urls = row_data["image_urls"]
+                        
                         if image_urls:
                             new_updated_properties[main_url] = image_urls
+                            updated_count += 1
+                
+                except Exception as e:
+                    print(f"⚠️  Matrix comparison failed for property {main_hash}: {e}")
+                    # Fallback to row_details comparison
+                    latest_row_data = latest_row_details[latest_row]
+                    earlier_row_data = earlier_row_details[earlier_row]
+                    
+                    latest_img_hashes = set(latest_row_data["image_hashes"])
+                    earlier_img_hashes = set(earlier_row_data["image_hashes"])
+                    
+                    if latest_img_hashes != earlier_img_hashes:
+                        main_url = latest_row_data["main_url"]
+                        image_urls = latest_row_data["image_urls"]
+                        if image_urls:
+                            new_updated_properties[main_url] = image_urls
+                            updated_count += 1
 
         comparison_time = time.time() - start_time
         
-        print(f"✅ GraphBLAS matrix comparison completed in {comparison_time:.2f}s")
-        print(f"📊 Results: {len(new_properties)} new, {len(new_updated_properties) - len(new_properties)} updated, {len(removed_properties)} removed")
+        print(f"✅ Hash matrix comparison completed in {comparison_time:.2f}s")
+        print(f"📊 Results: {new_count} new properties, {updated_count} updated properties, {removed_count} removed properties")
         print(f"🔗 Common properties analyzed: {len(common_properties)}")
 
         return new_updated_properties, removed_properties
 
     async def process_comparison(self, url1: str, url2: str) -> Dict[str, Any]:
         """
-        Main method to process comparison using GraphBLAS matrix operations
+        Main method to process comparison using hash-value matrices
+        Returns final JSON in the same format as original
         """
         total_start_time = time.time()
 
-        print("🎯 Starting GraphBLAS Real Estate Data Comparison")
-        print("=" * 55)
+        print("🎯 Starting Hash-Value Matrix Comparison")
+        print("=" * 45)
 
         # Determine file order
         print("📅 Determining file chronology...")
@@ -363,18 +321,13 @@ class RealEstateMatrixComparator:
 
         print()
 
-        # Build global hash index for aligned matrices
-        hash_to_col, col_to_hash = self.build_global_hash_index(latest_data, earlier_data)
-        ncols = len(col_to_hash)
-        print()
-
-        # Create aligned matrices
-        print("🔨 Building aligned sparse matrices...")
+        # Create hash-value matrices (101 columns each)
+        print("🔨 Building hash-value matrices (101 cols each)...")
         latest_matrix, latest_main_hashes, latest_row_details = (
-            self.create_aligned_matrix(latest_data, hash_to_col, ncols, "Latest")
+            self.create_hash_matrix(latest_data, "Latest")
         )
         earlier_matrix, earlier_main_hashes, earlier_row_details = (
-            self.create_aligned_matrix(earlier_data, hash_to_col, ncols, "Earlier")
+            self.create_hash_matrix(earlier_data, "Earlier")
         )
         print()
 
@@ -382,36 +335,34 @@ class RealEstateMatrixComparator:
         if earlier_matrix.nrows == 0:
             print("⚠️  Earlier dataset is empty - treating all latest properties as new")
             new_updated_properties = {}
-            for row_idx, main_hash in enumerate(latest_main_hashes):
-                main_url = self.hash_to_url[main_hash]
-                image_hashes = latest_row_details[row_idx]["image_hashes"]
-                image_urls = [self.hash_to_url[h] for h in image_hashes if h in self.hash_to_url]
+            for row_idx, row_data in latest_row_details.items():
+                main_url = row_data["main_url"]
+                image_urls = row_data["image_urls"]
                 if image_urls:
                     new_updated_properties[main_url] = image_urls
             removed_properties = {}
         else:
-            # Use GraphBLAS operations for comparison
-            new_updated_properties, removed_properties = self.compare_matrices_graphblas(
+            # Use hash matrix operations for comparison
+            new_updated_properties, removed_properties = self.compare_hash_matrices(
                 latest_matrix,
                 latest_main_hashes,
                 latest_row_details,
                 earlier_matrix,
                 earlier_main_hashes,
-                earlier_row_details,
-                hash_to_col,
-                col_to_hash
+                earlier_row_details
             )
 
         total_time = time.time() - total_start_time
 
         print()
-        print("🎉 GraphBLAS Comparison completed!")
+        print("🎉 Hash-Value Matrix Comparison completed!")
         print(f"⏱️  Total processing time: {total_time:.2f}s")
         print(f"🔗 Total URLs hashed: {len(self.hash_to_url):,}")
         print(f"📊 Properties with changes: {len(new_updated_properties)}")
         print(f"🏠 Properties removed: {len(removed_properties)}")
         print(f"🧮 Matrix dimensions: {latest_matrix.nrows}×{latest_matrix.ncols} (latest), {earlier_matrix.nrows}×{earlier_matrix.ncols} (earlier)")
 
+        # Return in original JSON format
         result = {
             "comparison_timestamp": datetime.now().isoformat(),
             "latest_file": latest_url,
@@ -419,18 +370,11 @@ class RealEstateMatrixComparator:
             "total_properties_found": len(new_updated_properties),
             "total_properties_removed": len(removed_properties),
             "processing_time_seconds": round(total_time, 2),
-            "matrix_info": {
-                "latest_matrix_shape": [latest_matrix.nrows, latest_matrix.ncols],
-                "earlier_matrix_shape": [earlier_matrix.nrows, earlier_matrix.ncols],
-                "global_hash_columns": ncols,
-                "latest_matrix_sparsity": round((latest_matrix.nrows * latest_matrix.ncols - latest_matrix.nvals) / (latest_matrix.nrows * latest_matrix.ncols) * 100, 2) if latest_matrix.nvals > 0 else 100,
-                "earlier_matrix_sparsity": round((earlier_matrix.nrows * earlier_matrix.ncols - earlier_matrix.nvals) / (earlier_matrix.nrows * earlier_matrix.ncols) * 100, 2) if earlier_matrix.nvals > 0 else 100
-            },
             "properties": new_updated_properties,
             "removed_properties": removed_properties,
             "hash_mappings": {
                 "total_urls_hashed": len(self.hash_to_url),
-                "sample_mappings": dict(list(self.hash_to_url.items())[:5]),
+                "sample_mappings": {str(k): v for k, v in list(self.hash_to_url.items())[:5]},
             },
         }
 
@@ -438,9 +382,9 @@ class RealEstateMatrixComparator:
 
 
 async def main():
-    """Example usage of the GraphBLAS RealEstateMatrixComparator"""
+    """Example usage of the Hash-Value Matrix RealEstateMatrixComparator"""
 
-    print("🏠 GraphBLAS Real Estate Data Comparator")
+    print("🏠 Hash-Value Matrix Real Estate Comparator")
     print("=" * 45)
 
     base_s3_url = "https://secondbrainscrape.s3.us-east-1.amazonaws.com/"
@@ -457,7 +401,7 @@ async def main():
         return result
 
     output_filename = (
-        f"graphblas_property_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        f"hash_matrix_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     )
 
     print(f"💾 Saving results to: {output_filename}")
@@ -471,10 +415,6 @@ async def main():
     print(f"Properties removed: {result.get('total_properties_removed', 0)}")
     print(f"Processing time: {result.get('processing_time_seconds', 0)}s")
     print(f"URLs processed: {result.get('hash_mappings', {}).get('total_urls_hashed', 0):,}")
-    
-    matrix_info = result.get('matrix_info', {})
-    print(f"Latest matrix: {matrix_info.get('latest_matrix_shape', 'N/A')} ({matrix_info.get('latest_matrix_sparsity', 'N/A')}% sparse)")
-    print(f"Earlier matrix: {matrix_info.get('earlier_matrix_shape', 'N/A')} ({matrix_info.get('earlier_matrix_sparsity', 'N/A')}% sparse)")
 
     if result.get("properties"):
         sample_prop = next(iter(result["properties"].items()))
