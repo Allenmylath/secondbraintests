@@ -1,7 +1,6 @@
 import json
 import requests
 import hashlib
-import numpy as np
 from datetime import datetime
 from typing import Dict, List, Tuple, Any
 import graphblas as gb
