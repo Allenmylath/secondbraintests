@@ -1,233 +1,398 @@
-import graphblas as gb
-import numpy as np
 import json
+import requests
+import hashlib
+import numpy as np
+from datetime import datetime
+from typing import Dict, List, Tuple, Any
+import graphblas as gb
+from urllib.parse import urlparse
+import re
+import time
 
-def create_demo_matrices():
-    """Create demo input matrices for testing"""
-    
-    # Today's Matrix (3 houses)
-    # Row 1: house_A with img1, img2, img3
-    # Row 2: house_B with img4, img5  
-    # Row 3: house_C with img6, img7, img8, img9
-    today_data = [
-        [1001, 2001, 2002, 2003, 0, 0, 0],  # house_A: 1001, images: 2001,2002,2003
-        [1002, 2004, 2005, 0, 0, 0, 0],     # house_B: 1002, images: 2004,2005
-        [1003, 2006, 2007, 2008, 2009, 0, 0] # house_C: 1003, images: 2006,2007,2008,2009
-    ]
-    
-    # Yesterday's Matrix (3 houses)  
-    # Row 1: house_A with img1, img2, img3 (SAME as today)
-    # Row 2: house_D with img10, img11 (DIFFERENT house)
-    # Row 3: house_C with img6, img12 (DIFFERENT images)
-    yesterday_data = [
-        [1001, 2001, 2002, 2003, 0, 0, 0],  # house_A: same images
-        [1004, 2010, 2011, 0, 0, 0, 0],     # house_D: different house  
-        [1003, 2006, 2012, 0, 0, 0, 0]      # house_C: different images (2012 instead of 2007,2008,2009)
-    ]
-    
-    # Convert to GraphBLAS matrices
-    today_matrix = gb.Matrix.from_dense(np.array(today_data, dtype=np.int64))
-    yesterday_matrix = gb.Matrix.from_dense(np.array(yesterday_data, dtype=np.int64))
-    
-    return today_matrix, yesterday_matrix
 
-def find_house_in_yesterday(house_hash, yesterday_main_col):
-    """
-    Pure GraphBLAS: Find if house_hash exists in yesterday's main column
-    Returns: (found, row_index)
-    """
-    # Create a vector with the target hash value at all positions
-    target_vector = gb.Vector.full(yesterday_main_col.size, house_hash, dtype=gb.dtypes.INT64)
-    
-    # Element-wise comparison: where yesterday_main_col == house_hash
-    match_mask = yesterday_main_col.ewise_mult(target_vector, gb.binary.eq)
-    
-    # Check if any match exists
-    match_indices = match_mask.to_values()
-    if len(match_indices[0]) > 0:
-        return True, match_indices[0][0]  # Found, return first match index
-    else:
-        return False, None
+class RealEstateMatrixComparator:
+    def __init__(self, base_s3_url: str):
+        """
+        Initialize the comparator with base S3 URL pattern
+        Example: "https://secondbrainscrape.s3.us-east-1.amazonaws.com/"
+        """
+        self.base_s3_url = base_s3_url
+        self.hash_to_url = {}  # BLAKE hash -> original URL mapping
+        self.url_to_hash = {}  # original URL -> BLAKE hash mapping
 
-def merge_image_vectors_graphblas(today_images, yesterday_images):
-    """
-    Pure GraphBLAS: Merge two image vectors (union operation)
-    """
-    # Create masks for non-zero elements
-    today_mask = today_images.apply(gb.unary.one, gb.dtypes.BOOL)
-    yesterday_mask = yesterday_images.apply(gb.unary.one, gb.dtypes.BOOL)
-    
-    # Union: take today's images where they exist, otherwise yesterday's
-    # Use ewise_add with FIRST operator to prioritize today's values
-    merged = today_images.ewise_add(yesterday_images, gb.binary.first)
-    
-    return merged
+    def blake_hash(self, url: str) -> str:
+        """Generate BLAKE2b hash for URL"""
+        return hashlib.blake2b(url.encode("utf-8")).hexdigest()
 
-def vectors_are_equal(vec1, vec2):
-    """
-    Pure GraphBLAS: Check if two vectors are identical
-    """
-    # Element-wise comparison
-    diff_mask = vec1.ewise_mult(vec2, gb.binary.ne)
-    
-    # If any differences exist, vectors are not equal
-    has_difference = diff_mask.reduce(gb.monoid.lor) if diff_mask.nvals > 0 else False
-    
-    return not has_difference
+    def add_url_mapping(self, url: str) -> str:
+        """Add URL to hash mapping and return hash"""
+        url_hash = self.blake_hash(url)
+        self.hash_to_url[url_hash] = url
+        self.url_to_hash[url] = url_hash
+        return url_hash
 
-def find_changed_houses_pure_graphblas(today_matrix, yesterday_matrix):
-    """
-    Pure GraphBLAS implementation - no numpy operations
-    """
-    print("Processing matrices with pure GraphBLAS...")
-    print(f"Today matrix shape: {today_matrix.shape}")
-    print(f"Yesterday matrix shape: {yesterday_matrix.shape}")
-    
-    # Extract main URL columns using GraphBLAS
-    today_main_col = today_matrix[:, 0]
-    yesterday_main_col = yesterday_matrix[:, 0]
-    
-    print(f"\nToday's house hashes: {[today_main_col[i].value for i in range(today_main_col.size)]}")
-    print(f"Yesterday's house hashes: {[yesterday_main_col[i].value for i in range(yesterday_main_col.size)]}")
-    
-    # Collect changed rows using GraphBLAS matrices
-    changed_row_indices = []
-    changed_row_data = []
-    
-    # Process each house in today's matrix
-    for i in range(today_matrix.nrows):
-        today_house_hash = today_main_col[i].value
-        if today_house_hash == 0:  # Skip empty rows
-            continue
-            
-        print(f"\nProcessing house {today_house_hash}...")
-        
-        # Find if this house existed yesterday using pure GraphBLAS
-        found, yesterday_row_idx = find_house_in_yesterday(today_house_hash, yesterday_main_col)
-        
-        if not found:
-            # NEW HOUSE: Take entire row from today
-            print(f"  → NEW HOUSE: {today_house_hash}")
-            today_row = today_matrix[i, :]
-            changed_row_indices.append(i)
-            # Convert row to list for building final matrix
-            row_values = [today_row[j].value for j in range(today_row.size)]
-            changed_row_data.append(row_values)
-            
-        else:
-            # EXISTING HOUSE: Check if images changed using GraphBLAS
-            print(f"  → EXISTING HOUSE: {today_house_hash}, checking images...")
-            
-            # Extract image vectors (columns 1 onwards)
-            today_images = today_matrix[i, 1:]
-            yesterday_images = yesterday_matrix[yesterday_row_idx, 1:]
-            
-            today_img_list = [today_images[j].value for j in range(today_images.size)]
-            yesterday_img_list = [yesterday_images[j].value for j in range(yesterday_images.size)]
-            
-            print(f"    Today's images: {today_img_list}")
-            print(f"    Yesterday's images: {yesterday_img_list}")
-            
-            # Compare image vectors using GraphBLAS
-            if not vectors_are_equal(today_images, yesterday_images):
-                print("    → IMAGES CHANGED: merging with GraphBLAS...")
-                
-                # Merge images using GraphBLAS
-                merged_images = merge_image_vectors_graphblas(today_images, yesterday_images)
-                merged_img_list = [merged_images[j].value for j in range(merged_images.size)]
-                
-                print(f"    → Merged images: {merged_img_list}")
-                
-                # Build complete row: [main_url_hash] + [merged_images]
-                complete_row = [today_house_hash] + merged_img_list
-                changed_row_data.append(complete_row)
+    def extract_date_from_filename(self, filename: str) -> datetime:
+        """Extract date from filename like '20250627_020118.json'"""
+        match = re.search(r"(\d{8}_\d{6})\.json", filename)
+        if match:
+            date_str = match.group(1)
+            return datetime.strptime(date_str, "%Y%m%d_%H%M%S")
+        raise ValueError(f"Cannot extract date from filename: {filename}")
+
+    def fetch_s3_data(self, url: str) -> Dict[str, Any]:
+        """Fetch JSON data from S3 URL"""
+        print(f"📥 Downloading data from: {url}")
+        start_time = time.time()
+
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            data = response.json()
+
+            download_time = time.time() - start_time
+            data_size_mb = len(response.content) / (1024 * 1024)
+
+            print(
+                f"✅ Download completed: {data_size_mb:.2f} MB in {download_time:.2f}s ({data_size_mb/download_time:.2f} MB/s)"
+            )
+            print(f"📊 Properties found: {len(data)}")
+
+            return data
+
+        except Exception as e:
+            print(f"❌ Error downloading from {url}: {e}")
+            return {}
+
+    def find_latest_files(self, url1: str, url2: str) -> Tuple[str, str]:
+        """Determine which URL is latest and which is earlier based on filename dates"""
+        try:
+            filename1 = urlparse(url1).path.split("/")[-1]
+            filename2 = urlparse(url2).path.split("/")[-1]
+
+            date1 = self.extract_date_from_filename(filename1)
+            date2 = self.extract_date_from_filename(filename2)
+
+            if date1 > date2:
+                return url1, url2  # latest, earlier
             else:
-                print("    → IMAGES SAME: skipping...")
-    
-    # Build final result matrix using GraphBLAS
-    if changed_row_data:
-        print(f"\nBuilding final matrix with {len(changed_row_data)} changed rows...")
-        for i, row in enumerate(changed_row_data):
-            print(f"  Row {i+1}: {row}")
-        
-        # Convert to GraphBLAS matrix
-        result_matrix = gb.Matrix.from_dense(np.array(changed_row_data, dtype=np.int64))
-        return result_matrix
-    else:
-        print("\nNo changes found!")
-        # Return empty matrix with same column count
-        return gb.Matrix.sparse(gb.dtypes.INT64, 0, today_matrix.ncols)
+                return url2, url1  # latest, earlier
 
-def demo_keyval_conversion(changes_matrix):
-    """Demo conversion using mock keyval JSON"""
-    
-    # Mock keyval mappings
-    main_keyval = {
-        "1001": "https://remax.ca/house_A",
-        "1002": "https://remax.ca/house_B", 
-        "1003": "https://remax.ca/house_C",
-        "1004": "https://remax.ca/house_D"
-    }
-    
-    image_keyval = {
-        "2001": "img1.jpg",
-        "2002": "img2.jpg", 
-        "2003": "img3.jpg",
-        "2004": "img4.jpg",
-        "2005": "img5.jpg",
-        "2006": "img6.jpg",
-        "2007": "img7.jpg",
-        "2008": "img8.jpg",
-        "2009": "img9.jpg",
-        "2010": "img10.jpg",
-        "2011": "img11.jpg",
-        "2012": "img12.jpg"
-    }
-    
-    final_json = {}
-    
-    print("\nConverting to actual URLs...")
-    for i in range(changes_matrix.nrows):
-        # Extract row using GraphBLAS
-        row_vector = changes_matrix[i, :]
-        main_url_hash = str(int(row_vector[0].value))
-        image_hashes = [str(int(row_vector[j].value)) for j in range(1, row_vector.size) if row_vector[j].value != 0]
-        
-        main_url = main_keyval.get(main_url_hash)
-        image_urls = [image_keyval.get(h) for h in image_hashes if image_keyval.get(h)]
-        
-        if main_url:
-            final_json[main_url] = image_urls
-            print(f"  {main_url}: {image_urls}")
-    
-    return final_json
+        except Exception:
+            return url1, url2
 
-# Run the demo
+    def create_property_matrix(
+        self, data: Dict[str, Any], dataset_name: str = ""
+    ) -> Tuple[gb.Matrix, List[str], Dict[int, List[str]]]:
+        """
+        Create GraphBLAS sparse matrix from property data
+        Returns: (matrix, list of main_url_hashes for row mapping, row_to_image_hashes mapping)
+        """
+        print(f"🔧 Creating matrix for {dataset_name} dataset...")
+        start_time = time.time()
+
+        properties = []
+        main_url_hashes = []
+        row_to_image_hashes = {}
+        total_images = 0
+
+        for main_url, property_data in data.items():
+            if not isinstance(property_data, dict) or "images" not in property_data:
+                continue
+
+            main_url_hash = self.add_url_mapping(main_url)
+            main_url_hashes.append(main_url_hash)
+
+            images = property_data.get("images", [])
+            image_hashes = []
+
+            for img_url in images[:100]:  # Limit to 100
+                if img_url and isinstance(img_url, str) and img_url.strip():
+                    # Skip SVG logos and other non-photo images
+                    if not any(
+                        skip in img_url.lower()
+                        for skip in [".svg", "logo", "remax_residential"]
+                    ):
+                        img_hash = self.add_url_mapping(img_url)
+                        image_hashes.append(img_hash)
+
+            total_images += len(image_hashes)
+            row_idx = len(properties)
+            row_to_image_hashes[row_idx] = image_hashes
+
+            properties.append(
+                {"main_url_hash": main_url_hash, "image_hashes": image_hashes}
+            )
+
+        if not properties:
+            print(f"⚠️  No valid properties found in {dataset_name}")
+            empty_matrix = gb.Matrix(gb.dtypes.BOOL, nrows=0, ncols=101)
+            return empty_matrix, [], {}
+
+        nrows = len(properties)
+        ncols = 101  # 1 for main URL + 100 for images
+
+        matrix = gb.Matrix(gb.dtypes.BOOL, nrows=nrows, ncols=ncols)
+
+        for row_idx, prop in enumerate(properties):
+            matrix[row_idx, 0] = True  # Main URL presence
+
+            # Columns 1-100: image URLs
+            for col_idx, img_hash in enumerate(prop["image_hashes"][:100]):
+                if col_idx < 100:
+                    matrix[row_idx, col_idx + 1] = True
+
+        matrix_time = time.time() - start_time
+        sparsity = (
+            (matrix.nrows * matrix.ncols - matrix.nvals)
+            / (matrix.nrows * matrix.ncols)
+            * 100
+        )
+
+        print(
+            f"✅ {dataset_name} matrix created: {nrows} rows × {ncols} cols in {matrix_time:.2f}s"
+        )
+        print(f"📈 Sparsity: {sparsity:.1f}% | Images processed: {total_images}")
+
+        return matrix, main_url_hashes, row_to_image_hashes
+
+    def compare_matrices(
+        self,
+        latest_matrix: gb.Matrix,
+        latest_main_hashes: List[str],
+        latest_row_to_images: Dict[int, List[str]],
+        earlier_matrix: gb.Matrix,
+        earlier_main_hashes: List[str],
+        earlier_row_to_images: Dict[int, List[str]],
+    ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+        """
+        Compare matrices and return new/updated properties AND removed properties
+        Returns: (new_updated_properties, removed_properties)
+        """
+        print("🔍 Comparing matrices...")
+        start_time = time.time()
+
+        new_updated_properties = {}
+        removed_properties = {}
+        new_properties_count = 0
+        updated_properties_count = 0
+        removed_properties_count = 0
+
+        latest_hash_set = set(latest_main_hashes)
+        earlier_hash_set = set(earlier_main_hashes)
+        earlier_hash_to_row = {
+            hash_val: idx for idx, hash_val in enumerate(earlier_main_hashes)
+        }
+
+        # Process latest properties (new/updated)
+        for latest_row_idx, main_url_hash in enumerate(latest_main_hashes):
+            main_url = self.hash_to_url[main_url_hash]
+
+            if main_url_hash not in earlier_hash_set:
+                # New property - add all its images
+                image_hashes = latest_row_to_images.get(latest_row_idx, [])
+                image_urls = [
+                    self.hash_to_url[hash_val]
+                    for hash_val in image_hashes
+                    if hash_val in self.hash_to_url
+                ]
+                new_updated_properties[main_url] = image_urls
+                new_properties_count += 1
+
+            else:
+                # Existing property - check for new images
+                earlier_row_idx = earlier_hash_to_row[main_url_hash]
+
+                latest_image_hashes = set(latest_row_to_images.get(latest_row_idx, []))
+                earlier_image_hashes = set(
+                    earlier_row_to_images.get(earlier_row_idx, [])
+                )
+
+                if latest_image_hashes:
+                    if not earlier_image_hashes:
+                        # No earlier images, treat all latest as new
+                        all_image_urls = [
+                            self.hash_to_url[hash_val]
+                            for hash_val in latest_image_hashes
+                            if hash_val in self.hash_to_url
+                        ]
+                        new_updated_properties[main_url] = all_image_urls
+                        updated_properties_count += 1
+                    else:
+                        # Find new images
+                        new_image_hashes = latest_image_hashes - earlier_image_hashes
+
+                        if new_image_hashes:
+                            # Merge all images (existing + new), limit to 100
+                            all_image_hashes = list(
+                                latest_image_hashes | earlier_image_hashes
+                            )[:100]
+                            all_image_urls = [
+                                self.hash_to_url[hash_val]
+                                for hash_val in all_image_hashes
+                                if hash_val in self.hash_to_url
+                            ]
+                            new_updated_properties[main_url] = all_image_urls
+                            updated_properties_count += 1
+
+        # Process removed properties (in earlier but not in latest)
+        for earlier_row_idx, main_url_hash in enumerate(earlier_main_hashes):
+            if main_url_hash not in latest_hash_set:
+                main_url = self.hash_to_url[main_url_hash]
+                image_hashes = earlier_row_to_images.get(earlier_row_idx, [])
+                image_urls = [
+                    self.hash_to_url[hash_val]
+                    for hash_val in image_hashes
+                    if hash_val in self.hash_to_url
+                ]
+                removed_properties[main_url] = image_urls
+                removed_properties_count += 1
+
+        comparison_time = time.time() - start_time
+        common_properties = len(latest_hash_set & earlier_hash_set)
+
+        print(f"✅ Matrix comparison completed in {comparison_time:.2f}s")
+        print(
+            f"📊 Results: {new_properties_count} new properties, {updated_properties_count} updated properties, {removed_properties_count} removed properties"
+        )
+        print(f"🔗 Common properties: {common_properties}")
+
+        return new_updated_properties, removed_properties
+
+    def process_comparison(self, url1: str, url2: str) -> Dict[str, Any]:
+        """
+        Main method to process comparison between two S3 URLs
+        Returns final JSON with new/updated properties AND removed properties
+        """
+        total_start_time = time.time()
+
+        print("🎯 Starting Real Estate Data Comparison")
+        print("=" * 50)
+
+        # Determine file order
+        print("📅 Determining file chronology...")
+        latest_url, earlier_url = self.find_latest_files(url1, url2)
+        print(f"📄 Latest file: {latest_url.split('/')[-1]}")
+        print(f"📄 Earlier file: {earlier_url.split('/')[-1]}")
+        print()
+
+        # Download data
+        print("🌐 Downloading data from S3...")
+        latest_data = self.fetch_s3_data(latest_url)
+        if not latest_data:
+            return {"error": "No latest data available"}
+
+        earlier_data = self.fetch_s3_data(earlier_url)
+        print()
+
+        # Create matrices
+        print("🔨 Building sparse matrices...")
+        latest_matrix, latest_main_hashes, latest_row_to_images = (
+            self.create_property_matrix(latest_data, "Latest")
+        )
+        earlier_matrix, earlier_main_hashes, earlier_row_to_images = (
+            self.create_property_matrix(earlier_data, "Earlier")
+        )
+        print()
+
+        # Special case handling
+        if earlier_matrix.nrows == 0:
+            print("⚠️  Earlier dataset is empty - treating all latest properties as new")
+            new_updated_properties = {}
+            for row_idx, main_url_hash in enumerate(latest_main_hashes):
+                main_url = self.hash_to_url[main_url_hash]
+                image_hashes = latest_row_to_images.get(row_idx, [])
+                image_urls = [
+                    self.hash_to_url[hash_val]
+                    for hash_val in image_hashes
+                    if hash_val in self.hash_to_url
+                ]
+                if image_urls:  # Only include properties that have images
+                    new_updated_properties[main_url] = image_urls
+            removed_properties = {}
+        else:
+            new_updated_properties, removed_properties = self.compare_matrices(
+                latest_matrix,
+                latest_main_hashes,
+                latest_row_to_images,
+                earlier_matrix,
+                earlier_main_hashes,
+                earlier_row_to_images,
+            )
+
+        total_time = time.time() - total_start_time
+
+        print()
+        print("🎉 Comparison completed!")
+        print(f"⏱️  Total processing time: {total_time:.2f}s")
+        print(f"🔗 Total URLs hashed: {len(self.hash_to_url):,}")
+        print(f"📊 Properties with changes: {len(new_updated_properties)}")
+        print(f"🏠 Properties removed: {len(removed_properties)}")
+
+        result = {
+            "comparison_timestamp": datetime.now().isoformat(),
+            "latest_file": latest_url,
+            "earlier_file": earlier_url,
+            "total_properties_found": len(new_updated_properties),
+            "total_properties_removed": len(removed_properties),
+            "processing_time_seconds": round(total_time, 2),
+            "properties": new_updated_properties,
+            "removed_properties": removed_properties,
+            "hash_mappings": {
+                "total_urls_hashed": len(self.hash_to_url),
+                "sample_mappings": dict(list(self.hash_to_url.items())[:5]),
+            },
+        }
+
+        return result
+
+
+def main():
+    """Example usage of the RealEstateMatrixComparator"""
+
+    print("🏠 Real Estate Data Comparator")
+    print("=" * 40)
+
+    base_s3_url = "https://secondbrainscrape.s3.us-east-1.amazonaws.com/"
+
+    # Example URLs (replace with actual URLs)
+    url1 = "https://secondbrainscrape.s3.us-east-1.amazonaws.com/20250627_020118.json"
+    url2 = "https://secondbrainscrape.s3.us-east-1.amazonaws.com/20250626_020103.json"
+
+    comparator = RealEstateMatrixComparator(base_s3_url)
+    result = comparator.process_comparison(url1, url2)
+
+    if "error" in result:
+        print(f"❌ Error: {result['error']}")
+        return result
+
+    output_filename = (
+        f"property_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    )
+
+    print(f"💾 Saving results to: {output_filename}")
+    with open(output_filename, "w") as f:
+        json.dump(result, f, indent=2)
+
+    print()
+    print("📈 SUMMARY")
+    print("-" * 20)
+    print(f"Properties found: {result.get('total_properties_found', 0)}")
+    print(f"Properties removed: {result.get('total_properties_removed', 0)}")
+    print(f"Processing time: {result.get('processing_time_seconds', 0)}s")
+    print(
+        f"URLs processed: {result.get('hash_mappings', {}).get('total_urls_hashed', 0):,}"
+    )
+
+    if result.get("properties"):
+        sample_prop = next(iter(result["properties"].items()))
+        print(f"Sample property: {len(sample_prop[1])} images")
+
+    if result.get("removed_properties"):
+        sample_removed = next(iter(result["removed_properties"].items()))
+        print(f"Sample removed property: {len(sample_removed[1])} images")
+
+    return result
+
+
 if __name__ == "__main__":
-    print("=== Pure GraphBLAS Real Estate Demo ===\n")
-    
-    # Create demo matrices
-    today_matrix, yesterday_matrix = create_demo_matrices()
-    
-    print("Today's Matrix:")
-    print(today_matrix.to_dense())
-    print("\nYesterday's Matrix:")  
-    print(yesterday_matrix.to_dense())
-    print("\n" + "="*50)
-    
-    # Find changed houses using pure GraphBLAS
-    changes_matrix = find_changed_houses_pure_graphblas(today_matrix, yesterday_matrix)
-    
-    print("\n" + "="*50)
-    print("Final Changes Matrix:")
-    if changes_matrix.nrows > 0:
-        print(changes_matrix.to_dense())
-    else:
-        print("(empty)")
-    
-    # Convert to final JSON
-    print("\n" + "="*50)
-    final_result = demo_keyval_conversion(changes_matrix)
-    
-    print(f"\nFinal JSON Output:")
-    print(json.dumps(final_result, indent=2))
+    main()
