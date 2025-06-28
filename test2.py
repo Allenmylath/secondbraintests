@@ -3,11 +3,12 @@ import asyncio
 import aiohttp
 import hashlib
 from datetime import datetime
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 import graphblas as gb
 from urllib.parse import urlparse
 import re
 import time
+import xml.etree.ElementTree as ET
 
 
 class RealEstateMatrixComparator:
@@ -16,9 +17,122 @@ class RealEstateMatrixComparator:
         Initialize the comparator with base S3 URL pattern
         Example: "https://secondbrainscrape.s3.us-east-1.amazonaws.com/"
         """
-        self.base_s3_url = base_s3_url
+        self.base_s3_url = base_s3_url.rstrip('/') + '/'
+        self.bucket_name = self.extract_bucket_name(base_s3_url)
         self.hash_to_url = {}  # BLAKE hash -> original URL mapping
         self.url_to_hash = {}  # original URL -> BLAKE hash mapping
+
+    def extract_bucket_name(self, s3_url: str) -> str:
+        """Extract bucket name from S3 URL"""
+        # Parse URL like: https://secondbrainscrape.s3.us-east-1.amazonaws.com/
+        parsed = urlparse(s3_url)
+        # Extract bucket name from subdomain
+        bucket_name = parsed.hostname.split('.')[0]
+        return bucket_name
+
+    async def list_bucket_files(self, session: aiohttp.ClientSession) -> List[Tuple[str, datetime]]:
+        """
+        Query S3 bucket to get list of JSON files with their timestamps
+        Returns list of (filename, datetime) tuples sorted by date (newest first)
+        """
+        print(f"🔍 Querying S3 bucket '{self.bucket_name}' for available files...")
+        
+        # S3 bucket listing URL (XML format)
+        bucket_list_url = f"https://{self.bucket_name}.s3.amazonaws.com/"
+        
+        try:
+            async with session.get(bucket_list_url) as response:
+                response.raise_for_status()
+                xml_content = await response.text()
+                
+                # Parse XML response
+                root = ET.fromstring(xml_content)
+                
+                # Find all files (Contents elements)
+                files_with_dates = []
+                
+                # S3 XML namespace
+                namespace = {'s3': 'http://s3.amazonaws.com/doc/2006-03-01/'}
+                
+                # Look for Contents elements (files)
+                for content in root.findall('.//s3:Contents', namespace):
+                    key_element = content.find('s3:Key', namespace)
+                    if key_element is not None:
+                        filename = key_element.text
+                        
+                        # Only process JSON files with the expected naming pattern
+                        if filename.endswith('.json') and re.match(r'\d{8}_\d{6}\.json', filename):
+                            try:
+                                file_date = self.extract_date_from_filename(filename)
+                                files_with_dates.append((filename, file_date))
+                            except ValueError:
+                                continue
+                
+                # Sort by date (newest first)
+                files_with_dates.sort(key=lambda x: x[1], reverse=True)
+                
+                print(f"✅ Found {len(files_with_dates)} JSON files in bucket")
+                
+                # Show the files found
+                for i, (filename, file_date) in enumerate(files_with_dates[:5]):  # Show first 5
+                    print(f"   {i+1}. {filename} ({file_date.strftime('%Y-%m-%d %H:%M:%S')})")
+                
+                if len(files_with_dates) > 5:
+                    print(f"   ... and {len(files_with_dates) - 5} more files")
+                
+                return files_with_dates
+                
+        except Exception as e:
+            print(f"❌ Error querying S3 bucket: {e}")
+            print(f"🔧 Falling back to direct HTTP listing...")
+            
+            # Fallback: try to get files via HTTP directory listing (if enabled)
+            try:
+                async with session.get(bucket_list_url) as response:
+                    if response.status == 200:
+                        html_content = await response.text()
+                        # Simple regex to find JSON files in HTML
+                        json_files = re.findall(r'href="([^"]+\.json)"', html_content)
+                        
+                        files_with_dates = []
+                        for filename in json_files:
+                            if re.match(r'\d{8}_\d{6}\.json', filename):
+                                try:
+                                    file_date = self.extract_date_from_filename(filename)
+                                    files_with_dates.append((filename, file_date))
+                                except ValueError:
+                                    continue
+                        
+                        files_with_dates.sort(key=lambda x: x[1], reverse=True)
+                        print(f"✅ Found {len(files_with_dates)} JSON files via HTTP listing")
+                        return files_with_dates
+                        
+            except Exception as fallback_error:
+                print(f"❌ Fallback method also failed: {fallback_error}")
+                return []
+
+    async def get_latest_two_files(self, session: aiohttp.ClientSession) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Get the two most recent JSON files from the S3 bucket
+        Returns (latest_url, second_latest_url) or (None, None) if insufficient files
+        """
+        files_with_dates = await self.list_bucket_files(session)
+        
+        if len(files_with_dates) < 2:
+            print(f"⚠️  Need at least 2 files for comparison, found {len(files_with_dates)}")
+            return None, None
+        
+        latest_file = files_with_dates[0][0]
+        second_latest_file = files_with_dates[1][0]
+        
+        latest_url = self.base_s3_url + latest_file
+        second_latest_url = self.base_s3_url + second_latest_file
+        
+        print(f"🎯 Selected files for comparison:")
+        print(f"   Latest: {latest_file}")
+        print(f"   Earlier: {second_latest_file}")
+        
+        return latest_url, second_latest_url
 
     def blake_hash(self, url: str) -> int:
         """Generate BLAKE2b hash for URL that fits in GraphBLAS UINT64"""
@@ -291,10 +405,106 @@ class RealEstateMatrixComparator:
 
         return new_updated_properties, removed_properties
 
+    async def process_comparison_auto(self) -> Dict[str, Any]:
+        """
+        Main method to process comparison using auto-discovered URLs from S3 bucket
+        Returns final JSON in the same format as original
+        """
+        total_start_time = time.time()
+
+        print("🎯 Starting Automated Hash-Value Matrix Comparison")
+        print("=" * 50)
+
+        async with aiohttp.ClientSession() as session:
+            # Auto-discover latest files from S3 bucket
+            print("🔍 Auto-discovering latest files from S3 bucket...")
+            latest_url, earlier_url = await self.get_latest_two_files(session)
+            
+            if not latest_url or not earlier_url:
+                return {"error": "Could not find sufficient files in S3 bucket for comparison"}
+
+            print(f"📄 Latest file: {latest_url.split('/')[-1]}")
+            print(f"📄 Earlier file: {earlier_url.split('/')[-1]}")
+            print()
+
+            # Download data asynchronously
+            print("🌐 Downloading data from S3 (parallel downloads)...")
+            latest_task = asyncio.create_task(self.fetch_s3_data(session, latest_url))
+            earlier_task = asyncio.create_task(self.fetch_s3_data(session, earlier_url))
+
+            latest_data, earlier_data = await asyncio.gather(latest_task, earlier_task)
+
+        if not latest_data:
+            return {"error": "No latest data available"}
+
+        print()
+
+        # Create hash-value matrices (101 columns each)
+        print("🔨 Building hash-value matrices (101 cols each)...")
+        latest_matrix, latest_main_hashes, latest_row_details = (
+            self.create_hash_matrix(latest_data, "Latest")
+        )
+        earlier_matrix, earlier_main_hashes, earlier_row_details = (
+            self.create_hash_matrix(earlier_data, "Earlier")
+        )
+        print()
+
+        # Special case handling
+        if earlier_matrix.nrows == 0:
+            print("⚠️  Earlier dataset is empty - treating all latest properties as new")
+            new_updated_properties = {}
+            for row_idx, row_data in latest_row_details.items():
+                main_url = row_data["main_url"]
+                image_urls = row_data["image_urls"]
+                if image_urls:
+                    new_updated_properties[main_url] = image_urls
+            removed_properties = {}
+        else:
+            # Use hash matrix operations for comparison
+            new_updated_properties, removed_properties = self.compare_hash_matrices(
+                latest_matrix,
+                latest_main_hashes,
+                latest_row_details,
+                earlier_matrix,
+                earlier_main_hashes,
+                earlier_row_details
+            )
+
+        total_time = time.time() - total_start_time
+
+        print()
+        print("🎉 Automated Hash-Value Matrix Comparison completed!")
+        print(f"⏱️  Total processing time: {total_time:.2f}s")
+        print(f"🔗 Total URLs hashed: {len(self.hash_to_url):,}")
+        print(f"📊 Properties with changes: {len(new_updated_properties)}")
+        print(f"🏠 Properties removed: {len(removed_properties)}")
+        print(f"🧮 Matrix dimensions: {latest_matrix.nrows}×{latest_matrix.ncols} (latest), {earlier_matrix.nrows}×{earlier_matrix.ncols} (earlier)")
+
+        # Return in original JSON format
+        result = {
+            "comparison_timestamp": datetime.now().isoformat(),
+            "latest_file": latest_url,
+            "earlier_file": earlier_url,
+            "total_properties_found": len(new_updated_properties),
+            "total_properties_removed": len(removed_properties),
+            "processing_time_seconds": round(total_time, 2),
+            "properties": new_updated_properties,
+            "removed_properties": removed_properties,
+            "hash_mappings": {
+                "total_urls_hashed": len(self.hash_to_url),
+                "sample_mappings": {str(k): v for k, v in list(self.hash_to_url.items())[:5]},
+            },
+            "bucket_info": {
+                "bucket_name": self.bucket_name,
+                "auto_discovery": True
+            }
+        }
+
+        return result
+
     async def process_comparison(self, url1: str, url2: str) -> Dict[str, Any]:
         """
-        Main method to process comparison using hash-value matrices
-        Returns final JSON in the same format as original
+        Original method to process comparison with manual URLs (kept for backward compatibility)
         """
         total_start_time = time.time()
 
@@ -382,26 +592,24 @@ class RealEstateMatrixComparator:
 
 
 async def main():
-    """Example usage of the Hash-Value Matrix RealEstateMatrixComparator"""
+    """Example usage of the Auto-Discovery Hash-Value Matrix RealEstateMatrixComparator"""
 
-    print("🏠 Hash-Value Matrix Real Estate Comparator")
-    print("=" * 45)
+    print("🏠 Auto-Discovery Hash-Value Matrix Real Estate Comparator")
+    print("=" * 55)
 
     base_s3_url = "https://secondbrainscrape.s3.us-east-1.amazonaws.com/"
 
-    # Example URLs (replace with actual URLs)
-    url1 = "https://secondbrainscrape.s3.us-east-1.amazonaws.com/20250627_020118.json"
-    url2 = "https://secondbrainscrape.s3.us-east-1.amazonaws.com/20250626_020103.json"
-
     comparator = RealEstateMatrixComparator(base_s3_url)
-    result = await comparator.process_comparison(url1, url2)
+    
+    # Use the new auto-discovery method
+    result = await comparator.process_comparison_auto()
 
     if "error" in result:
         print(f"❌ Error: {result['error']}")
         return result
 
     output_filename = (
-        f"hash_matrix_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        f"auto_hash_matrix_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     )
 
     print(f"💾 Saving results to: {output_filename}")
@@ -411,6 +619,8 @@ async def main():
     print()
     print("📈 SUMMARY")
     print("-" * 20)
+    print(f"Bucket: {result.get('bucket_info', {}).get('bucket_name', 'Unknown')}")
+    print(f"Auto-discovery: {result.get('bucket_info', {}).get('auto_discovery', False)}")
     print(f"Properties found: {result.get('total_properties_found', 0)}")
     print(f"Properties removed: {result.get('total_properties_removed', 0)}")
     print(f"Processing time: {result.get('processing_time_seconds', 0)}s")
