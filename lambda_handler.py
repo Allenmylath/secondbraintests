@@ -249,7 +249,7 @@ class RealEstateMatrixComparatorLambda:
             return {}
 
     def create_hash_matrix(self, data: Dict[str, Any], dataset_name: str = "") -> Tuple[gb.Matrix, List[int], Dict[int, Dict[str, Any]]]:
-        """Create GraphBLAS matrix with hash values"""
+        """Create GraphBLAS matrix with hash values and store complete property data"""
         print(f"🔧 Creating hash-value matrix for {dataset_name} dataset...")
         start_time = time.time()
 
@@ -279,11 +279,13 @@ class RealEstateMatrixComparatorLambda:
             total_images += len(image_hashes)
             row_idx = len(properties)
             
+            # ENHANCED: Store complete property data along with hash info
             row_details[row_idx] = {
                 "main_hash": main_url_hash,
                 "main_url": main_url,
                 "image_hashes": image_hashes,
-                "image_urls": image_urls
+                "image_urls": image_urls,
+                "property_data": property_data  # NEW: Store all property details
             }
 
             properties.append({
@@ -319,8 +321,8 @@ class RealEstateMatrixComparatorLambda:
     def compare_hash_matrices(self, latest_matrix: gb.Matrix, latest_main_hashes: List[int], 
                             latest_row_details: Dict[int, Dict[str, Any]], earlier_matrix: gb.Matrix, 
                             earlier_main_hashes: List[int], earlier_row_details: Dict[int, Dict[str, Any]]
-                            ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
-        """Compare hash-value matrices using GraphBLAS operations"""
+                            ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+        """Compare hash-value matrices and return complete property data"""
         print("🔍 Comparing hash-value matrices using GraphBLAS...")
         start_time = time.time()
 
@@ -345,11 +347,11 @@ class RealEstateMatrixComparatorLambda:
             row_idx = latest_hash_to_row[main_hash]
             row_data = latest_row_details[row_idx]
             main_url = row_data["main_url"]
-            image_urls = row_data["image_urls"]
             
-            if image_urls:
-                new_updated_properties[main_url] = image_urls
-                new_count += 1
+            # ENHANCED: Store complete property data instead of just image URLs
+            complete_property_data = row_data["property_data"]
+            new_updated_properties[main_url] = complete_property_data
+            new_count += 1
 
         # Find removed properties
         removed_props = earlier_main_set - latest_main_set
@@ -359,9 +361,10 @@ class RealEstateMatrixComparatorLambda:
             row_idx = earlier_hash_to_row[main_hash]
             row_data = earlier_row_details[row_idx]
             main_url = row_data["main_url"]
-            image_urls = row_data["image_urls"]
             
-            removed_properties[main_url] = image_urls
+            # ENHANCED: Store complete property data instead of just image URLs
+            complete_property_data = row_data["property_data"]
+            removed_properties[main_url] = complete_property_data
             removed_count += 1
 
         # Find updated properties
@@ -386,11 +389,11 @@ class RealEstateMatrixComparatorLambda:
                     if latest_image_hashes != earlier_image_hashes:
                         row_data = latest_row_details[latest_row]
                         main_url = row_data["main_url"]
-                        image_urls = row_data["image_urls"]
                         
-                        if image_urls:
-                            new_updated_properties[main_url] = image_urls
-                            updated_count += 1
+                        # ENHANCED: Store complete property data instead of just image URLs
+                        complete_property_data = row_data["property_data"]
+                        new_updated_properties[main_url] = complete_property_data
+                        updated_count += 1
                 
                 except Exception as e:
                     print(f"⚠️  Matrix comparison failed for property {main_hash}: {e}")
@@ -475,9 +478,9 @@ class RealEstateMatrixComparatorLambda:
             new_updated_properties = {}
             for row_idx, row_data in latest_row_details.items():
                 main_url = row_data["main_url"]
-                image_urls = row_data["image_urls"]
-                if image_urls:
-                    new_updated_properties[main_url] = image_urls
+                # ENHANCED: Use complete property data instead of just image URLs
+                complete_property_data = row_data["property_data"]
+                new_updated_properties[main_url] = complete_property_data
             removed_properties = {}
         else:
             new_updated_properties, removed_properties = self.compare_hash_matrices(
@@ -487,7 +490,7 @@ class RealEstateMatrixComparatorLambda:
 
         total_time = time.time() - total_start_time
 
-        # Prepare result
+        # Prepare enhanced result with complete property data
         result = {
             "comparison_timestamp": datetime.now().isoformat(),
             "trigger_file": trigger_filename,
@@ -496,8 +499,8 @@ class RealEstateMatrixComparatorLambda:
             "total_properties_found": len(new_updated_properties),
             "total_properties_removed": len(removed_properties),
             "processing_time_seconds": round(total_time, 2),
-            "properties": new_updated_properties,
-            "removed_properties": removed_properties,
+            "properties": new_updated_properties,  # Now contains complete property data
+            "removed_properties": removed_properties,  # Now contains complete property data
             "hash_mappings": {
                 "total_urls_hashed": len(self.hash_to_url),
                 "sample_mappings": {str(k): v for k, v in list(self.hash_to_url.items())[:5]},
