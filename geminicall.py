@@ -36,7 +36,7 @@ class PropertyImageProcessor:
     ):
         # Load from environment variables or use provided values
         self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
-        self.gemini_model = gemini_model or os.getenv("GEMINI_MODEL", "gemini-2.0-pro")
+        self.gemini_model = gemini_model or os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
         self.output_file = output_file
         self.log_file = (
             log_file or f"property_analysis_{time.strftime('%Y%m%d_%H%M%S')}.log"
