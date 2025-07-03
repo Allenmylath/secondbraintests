@@ -1,11 +1,11 @@
-import asyncio
+import trio
 import json
 import logging
 import os
 import time
+import uuid
+import re
 from typing import Dict, List, AsyncGenerator, Tuple
-from concurrent.futures import ThreadPoolExecutor
-import threading
 
 import httpx
 import pybase64
@@ -13,7 +13,6 @@ import requests
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from tqdm.asyncio import tqdm
 
 # Import the Master Realtor prompt template
 from realtor_prompt import MASTER_REALTOR_PROMPT
@@ -32,15 +31,11 @@ class PropertyImageProcessor:
         max_size_mb: float = 50.0,
         max_concurrent: int = 100,
         output_file: str = "property_analysis_results.json",
-        log_file: str = None,
     ):
         # Load from environment variables or use provided values
         self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
         self.gemini_model = gemini_model or os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
         self.output_file = output_file
-        self.log_file = (
-            log_file or f"property_analysis_{time.strftime('%Y%m%d_%H%M%S')}.log"
-        )
 
         if not self.gemini_api_key:
             raise ValueError(
@@ -55,40 +50,16 @@ class PropertyImageProcessor:
         # Configure Gemini client
         self.client = genai.Client(api_key=self.gemini_api_key)
 
-        # Thread pool for Gemini API calls
-        self.gemini_executor = ThreadPoolExecutor(
-            max_workers=max_concurrent, thread_name_prefix="gemini_api"
-        )
-
         # Rate limiting (200 per minute = ~3.33 per second) with thread safety
         self.last_request_times = []
-        self._rate_limit_lock = asyncio.Lock()
+        self._rate_limit_lock = trio.Lock()
 
-        # Setup detailed file logging
-        self._setup_logging()
-
-        # Progress tracking
-        self.images_processed = 0
-        self.api_responses = 0
-        self.total_properties = 0
-        self.total_images = 0
-
-        print(f"✅ Initialized with Gemini model: {self.gemini_model}")
-        print(f"📁 Output will be saved to: {self.output_file}")
-        print(f"📝 Detailed logs will be saved to: {self.log_file}")
-
-    def _setup_logging(self):
-        """Setup detailed file logging."""
+        # Setup logging for MLS tracking
         logging.basicConfig(
             level=logging.INFO,
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            handlers=[
-                logging.FileHandler(self.log_file, mode="w", encoding="utf-8"),
-                logging.StreamHandler(),  # This will be suppressed during tqdm
-            ],
+            format="%(asctime)s - %(levelname)s - %(message)s"
         )
         self.logger = logging.getLogger(__name__)
-        self.logger.info("PropertyImageProcessor initialized")
 
     def extract_properties_from_json(self, data: Dict) -> Dict[str, Dict]:
         """Extract property URLs, their JPEG images, and property details from JSON data."""
@@ -118,19 +89,88 @@ class PropertyImageProcessor:
                         "images": jpeg_images,
                         "details": property_details,
                     }
-                    self.logger.info(
-                        f"Found {len(jpeg_images)} JPEG images for {property_url}"
-                    )
+                    
+                    # Log MLS extraction result
+                    mls_info = property_details.get("mls_number", "NONE")
+                    is_genuine = property_details.get("mls_is_genuine", False)
+                    self.logger.info(f"Property: {property_url[:50]}... | MLS: {mls_info} ({'genuine' if is_genuine else 'generated'})")
 
-        self.total_properties = len(properties_dict)
-        self.total_images = sum(
-            len(prop["images"]) for prop in properties_dict.values()
-        )
-
-        self.logger.info(
-            f"Extracted {self.total_properties} properties with {self.total_images} total images"
-        )
+        self.logger.info(f"Extracted {len(properties_dict)} properties with images")
         return properties_dict
+
+    def _extract_mls_number(self, title: str) -> Tuple[str, bool]:
+        """Extract MLS number from title. Returns (mls_number, is_genuine)."""
+        self.logger.debug(f"MLS extraction from title: '{title}'")
+        
+        if not title or not isinstance(title, str):
+            generated_mls = f"GEN{uuid.uuid4().hex[:8].upper()}"
+            self.logger.debug(f"Empty/invalid title, generated: {generated_mls}")
+            return generated_mls, False
+
+        # Split by pipe and get the last part (most common MLS pattern)
+        parts = title.split("|")
+        self.logger.debug(f"Title split into {len(parts)} parts: {parts}")
+        
+        if len(parts) >= 2:
+            potential_mls = parts[-1].strip()
+        else:
+            # Try other common separators
+            for separator in ["-", ":", "#", "•"]:
+                if separator in title:
+                    parts = title.split(separator)
+                    potential_mls = parts[-1].strip()
+                    break
+            else:
+                # No separator found, check if entire title could be MLS
+                potential_mls = title.strip()
+
+        self.logger.debug(f"Potential MLS after extraction: '{potential_mls}'")
+
+        # Clean up potential MLS - remove common prefixes/suffixes
+        potential_mls = re.sub(r'^(MLS|#|ID|REF)[:.\s]*', '', potential_mls, flags=re.IGNORECASE)
+        potential_mls = re.sub(r'[^\w]', '', potential_mls)  # Remove all non-alphanumeric
+        
+        self.logger.debug(f"Cleaned potential MLS: '{potential_mls}'")
+
+        # Validate if it looks like a genuine MLS number
+        if self._is_valid_mls(potential_mls):
+            self.logger.info(f"✅ Found genuine MLS: {potential_mls}")
+            return potential_mls, True
+        else:
+            generated_mls = f"GEN{uuid.uuid4().hex[:8].upper()}"
+            self.logger.info(f"❌ No valid MLS found, generated: {generated_mls}")
+            return generated_mls, False
+
+    def _is_valid_mls(self, mls_candidate: str) -> bool:
+        """Validate if a string looks like a genuine MLS number."""
+        if not mls_candidate or len(mls_candidate) < 4:
+            return False
+        
+        # Check basic alphanumeric requirement
+        if not re.match(r'^[A-Za-z0-9]+$', mls_candidate):
+            return False
+        
+        # Must have both letters and numbers (typical MLS pattern)
+        has_letters = bool(re.search(r'[A-Za-z]', mls_candidate))
+        has_numbers = bool(re.search(r'[0-9]', mls_candidate))
+        
+        # Length should be reasonable (typically 4-15 characters)
+        reasonable_length = 4 <= len(mls_candidate) <= 15
+        
+        # Additional patterns that might indicate a genuine MLS
+        common_patterns = [
+            r'^[A-Z]{1,3}\d{4,}',  # Letters followed by numbers (e.g., AB123456)
+            r'^\d{4,}[A-Z]{1,3}',  # Numbers followed by letters (e.g., 123456AB)
+            r'^[A-Z0-9]{6,}$',     # Mixed alphanumeric, reasonable length
+        ]
+        
+        pattern_match = any(re.match(pattern, mls_candidate.upper()) for pattern in common_patterns)
+        
+        is_valid = has_letters and has_numbers and reasonable_length and pattern_match
+        
+        self.logger.debug(f"MLS validation for '{mls_candidate}': letters={has_letters}, numbers={has_numbers}, length={reasonable_length}, pattern={pattern_match} -> {is_valid}")
+        
+        return is_valid
 
     def _extract_property_details(self, property_data: Dict) -> Dict:
         """Extract key property details from JSON data."""
@@ -162,6 +202,12 @@ class PropertyImageProcessor:
         if "property_type" in property_data:
             details["property_type"] = property_data["property_type"]
 
+        # Extract MLS number from title - IMPROVED LOGIC
+        title = property_data.get("title", "")
+        mls_number, is_genuine = self._extract_mls_number(title)
+        details["mls_number"] = mls_number
+        details["mls_is_genuine"] = is_genuine
+
         return details
 
     def _create_prompt_with_details(self, property_details: Dict) -> str:
@@ -190,6 +236,14 @@ class PropertyImageProcessor:
         if property_details.get("property_type"):
             structured_details.append(f"Type: {property_details['property_type']}")
 
+        # IMPROVED: Always include MLS number with context about whether it's genuine
+        mls_number = property_details.get("mls_number", "Unknown")
+        is_genuine = property_details.get("mls_is_genuine", False)
+        if is_genuine:
+            structured_details.append(f"MLS: {mls_number}")
+        else:
+            structured_details.append(f"Property ID: {mls_number} (system-generated)")
+
         structured_details_text = (
             " | ".join(structured_details) if structured_details else "Not specified"
         )
@@ -210,8 +264,6 @@ class PropertyImageProcessor:
         """Generator that downloads and encodes images one by one."""
         for image_url in image_urls:
             try:
-                self.logger.debug(f"Downloading image: {image_url}")
-
                 # Download image with retries
                 for attempt in range(self.max_retries + 1):
                     try:
@@ -221,10 +273,7 @@ class PropertyImageProcessor:
                     except Exception as e:
                         if attempt < self.max_retries:
                             wait_time = 2**attempt
-                            self.logger.warning(
-                                f"Download attempt {attempt + 1} failed for {image_url}, retrying in {wait_time}s: {e}"
-                            )
-                            await asyncio.sleep(wait_time)
+                            await trio.sleep(wait_time)
                         else:
                             raise e
 
@@ -232,9 +281,6 @@ class PropertyImageProcessor:
                 image_base64 = pybase64.b64encode(response.content).decode("utf-8")
                 image_size_bytes = len(image_base64.encode("utf-8"))
 
-                self.logger.debug(
-                    f"Successfully encoded image: {image_url} ({image_size_bytes} bytes)"
-                )
                 yield image_base64, image_size_bytes
 
             except Exception as e:
@@ -246,15 +292,9 @@ class PropertyImageProcessor:
         client: httpx.AsyncClient,
         property_url: str,
         property_data: Dict,
-        pbar_images: tqdm,
-        pbar_responses: tqdm,
     ) -> Dict:
         """Process a single property with memory-efficient image handling."""
-        property_start_time = time.time()
-
         try:
-            self.logger.info(f"Starting processing of property: {property_url}")
-
             images_batch = []
             batch_size_bytes = 0
             max_size_bytes = self.max_size_mb * 1024 * 1024
@@ -266,41 +306,19 @@ class PropertyImageProcessor:
             ):
                 # Check if adding this image would exceed size limit
                 if batch_size_bytes + size_bytes > max_size_bytes and images_batch:
-                    self.logger.warning(
-                        f"Size limit reached for {property_url}. Processing {len(images_batch)} images"
-                    )
                     break
 
                 images_batch.append(encoded_image)
                 batch_size_bytes += size_bytes
                 images_processed_count += 1
 
-                # Update progress bar
-                pbar_images.update(1)
-
             if not images_batch:
                 error_msg = "No images could be processed"
-                self.logger.error(f"Failed to process {property_url}: {error_msg}")
-                return self._create_error_result(
-                    property_url, property_data, error_msg, property_start_time
-                )
+                return self._create_error_result(property_url, property_data, error_msg)
 
             # Auto-trigger API call when batch ready
-            self.logger.info(
-                f"Sending {len(images_batch)} images to Gemini API for {property_url}"
-            )
             description = await self._call_gemini_api(
                 images_batch, property_data["details"]
-            )
-
-            # Update API response progress bar
-            pbar_responses.update(1)
-
-            property_end_time = time.time()
-            processing_time = property_end_time - property_start_time
-
-            self.logger.info(
-                f"Successfully processed {property_url} in {processing_time:.1f}s"
             )
 
             result = {
@@ -309,7 +327,6 @@ class PropertyImageProcessor:
                     property_data["details"]
                 ),
                 "processing_info": {
-                    "processing_time_seconds": round(processing_time, 1),
                     "images_processed": images_processed_count,
                     "images_analyzed": property_data["images"][:images_processed_count],
                     "status": "success",
@@ -325,20 +342,16 @@ class PropertyImageProcessor:
         except Exception as e:
             error_msg = str(e)
             self.logger.error(f"Failed to process {property_url}: {error_msg}")
-            return self._create_error_result(
-                property_url, property_data, error_msg, property_start_time
-            )
+            return self._create_error_result(property_url, property_data, error_msg)
 
     def _create_error_result(
-        self, property_url: str, property_data: Dict, error_msg: str, start_time: float
+        self, property_url: str, property_data: Dict, error_msg: str
     ) -> Dict:
         """Create error result structure."""
-        processing_time = time.time() - start_time
         return {
             "property_url": property_url,
             "property_details": self._format_property_details(property_data["details"]),
             "processing_info": {
-                "processing_time_seconds": round(processing_time, 1),
                 "images_processed": 0,
                 "images_analyzed": [],
                 "status": "failed",
@@ -357,59 +370,67 @@ class PropertyImageProcessor:
             "bathrooms": details.get("bathrooms"),
             "property_type": details.get("property_type"),
             "mls_description": details.get("description"),
+            "mls_number": details.get("mls_number"),
+            "mls_is_genuine": details.get("mls_is_genuine", False),
         }
 
     async def process_all_properties(
         self, properties_dict: Dict[str, Dict]
     ) -> AsyncGenerator[Dict, None]:
-        """Generator that processes all properties with true concurrent processing."""
-        # Setup progress bars
-        pbar_images = tqdm(total=self.total_images, desc="Images Processed", position=0)
-        pbar_responses = tqdm(
-            total=self.total_properties, desc="API Responses", position=1
-        )
+        """Generator that processes all properties with true concurrent processing using trio nursery."""
+        # Use trio's memory channel for collecting results
+        send_channel, receive_channel = trio.open_memory_channel(0)
 
-        # Use a semaphore for concurrency control but allow true parallelism
-        semaphore = asyncio.Semaphore(self.max_concurrent)
-
-        async def process_with_semaphore(client, property_url, property_data):
+        async def process_with_semaphore(
+            client, property_url, property_data, semaphore
+        ):
             async with semaphore:
-                return await self.process_single_property(
-                    client, property_url, property_data, pbar_images, pbar_responses
+                result = await self.process_single_property(
+                    client, property_url, property_data
                 )
+                # Use send_nowait to avoid blocking and handle closed channel gracefully
+                try:
+                    send_channel.send_nowait(result)
+                except trio.ClosedResourceError:
+                    # Channel is closed, just ignore - this can happen during shutdown
+                    pass
+
+        async def run_all_tasks():
+            """Run all property processing tasks in a nursery."""
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with trio.open_nursery() as nursery:
+                    # Create semaphore for concurrency control
+                    semaphore = trio.Semaphore(self.max_concurrent)
+
+                    # Start all property processing tasks
+                    for property_url, property_data in properties_dict.items():
+                        nursery.start_soon(
+                            process_with_semaphore,
+                            client,
+                            property_url,
+                            property_data,
+                            semaphore,
+                        )
+            # When nursery exits, all tasks are complete - close the send channel
+            await send_channel.aclose()
 
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                # Create all tasks at once for true concurrent processing
-                tasks = [
-                    asyncio.create_task(
-                        process_with_semaphore(client, property_url, property_data)
-                    )
-                    for property_url, property_data in properties_dict.items()
-                ]
+            # Start the task runner in the background
+            async with trio.open_nursery() as main_nursery:
+                main_nursery.start_soon(run_all_tasks)
 
-                # Yield results as they complete (not in order!)
-                for coro in asyncio.as_completed(tasks):
-                    try:
-                        result = await coro
+                # Yield results as they arrive
+                async with receive_channel:
+                    async for result in receive_channel:
                         yield result
-                        # Memory is cleared automatically in process_single_property
-                    except Exception as e:
-                        self.logger.error(f"Error processing property: {e}")
 
         finally:
-            pbar_images.close()
-            pbar_responses.close()
-
-    def __del__(self):
-        """Cleanup thread pool executor."""
-        if hasattr(self, "gemini_executor"):
-            self.gemini_executor.shutdown(wait=True)
+            pass
 
     async def _call_gemini_api(
         self, images_base64: List[str], property_details: Dict
     ) -> str:
-        """Call Gemini API with retry logic and rate limiting - fully async and non-blocking."""
+        """Call Gemini API with retry logic, 300s timeout, and rate limiting - fully async and non-blocking."""
         await self._enforce_rate_limit()
 
         for attempt in range(self.max_retries + 1):
@@ -428,47 +449,33 @@ class PropertyImageProcessor:
                         )
                     )
 
-                self.logger.debug(
-                    f"Sending request to Gemini API (attempt {attempt + 1}) - Thread: {threading.current_thread().name}"
-                )
+                # Use trio's timeout with thread pool for blocking API calls
+                with trio.move_on_after(300) as cancel_scope:
+                    response = await trio.to_thread.run_sync(
+                        self._sync_gemini_call,
+                        contents,
+                    )
 
-                # Use dedicated thread pool executor for true async, non-blocking calls
-                loop = asyncio.get_event_loop()
-                response = await loop.run_in_executor(
-                    self.gemini_executor,
-                    self._sync_gemini_call,
-                    contents,
-                )
+                # Check if the operation was cancelled due to timeout
+                if cancel_scope.cancelled_caught:
+                    raise TimeoutError("Gemini API call timed out after 300 seconds")
 
-                self.logger.debug(
-                    f"Successfully received response from Gemini API - Thread: {threading.current_thread().name}"
-                )
                 return response.text
 
             except Exception as e:
                 if attempt < self.max_retries:
                     wait_time = 2**attempt
-                    self.logger.warning(
-                        f"API attempt {attempt + 1} failed, retrying in {wait_time}s: {e}"
-                    )
-                    await asyncio.sleep(wait_time)
+                    await trio.sleep(wait_time)
                 else:
                     self.logger.error(f"All API attempts failed: {e}")
                     raise e
 
     def _sync_gemini_call(self, contents):
-        """Synchronous Gemini API call to be run in thread pool."""
-        try:
-            return self.client.models.generate_content(
-                model=self.gemini_model,
-                contents=contents,
-            )
-        except Exception as e:
-            # Log the thread info for debugging
-            self.logger.debug(
-                f"Gemini API call failed in thread {threading.current_thread().name}: {e}"
-            )
-            raise e
+        """Synchronous Gemini API call to be run in trio thread pool."""
+        return self.client.models.generate_content(
+            model=self.gemini_model,
+            contents=contents,
+        )
 
     async def _enforce_rate_limit(self):
         """Rate limiting: 200 requests per minute (3.33 per second) - thread-safe and non-blocking."""
@@ -487,10 +494,6 @@ class PropertyImageProcessor:
                 sleep_time = 60 - (current_time - oldest_request_time)
 
                 if sleep_time > 0:
-                    self.logger.debug(
-                        f"Rate limit reached, sleeping for {sleep_time:.1f}s"
-                    )
-                    # Release lock during sleep to allow other tasks to check rate limit
                     pass  # We'll sleep outside the lock
             else:
                 sleep_time = 0
@@ -499,7 +502,7 @@ class PropertyImageProcessor:
 
         # Sleep outside the lock to not block other rate limit checks
         if sleep_time > 0:
-            await asyncio.sleep(sleep_time)
+            await trio.sleep(sleep_time)
 
     async def save_results(
         self, results_generator: AsyncGenerator[Dict, None], source_url: str = None
@@ -518,6 +521,8 @@ class PropertyImageProcessor:
                 "failed_analyses": 0,
                 "total_images_processed": 0,
                 "rate_limit_errors": 0,
+                "genuine_mls_count": 0,
+                "generated_mls_count": 0,
             },
         }
 
@@ -537,37 +542,38 @@ class PropertyImageProcessor:
                 "processing_info"
             ]["images_processed"]
 
+            # Track MLS statistics
+            if result["property_details"].get("mls_is_genuine", False):
+                results["processing_summary"]["genuine_mls_count"] += 1
+            else:
+                results["processing_summary"]["generated_mls_count"] += 1
+
         # Update final metadata
         results["analysis_metadata"]["total_properties_processed"] = len(
             results["properties"]
         )
 
+        # Log final MLS statistics
+        genuine_count = results["processing_summary"]["genuine_mls_count"]
+        generated_count = results["processing_summary"]["generated_mls_count"]
+        total_count = results["analysis_metadata"]["total_properties_processed"]
+        
+        self.logger.info(f"🏷️ MLS SUMMARY: {genuine_count} genuine, {generated_count} generated out of {total_count} total properties")
+
         # Save to file
         try:
             with open(self.output_file, "w", encoding="utf-8") as f:
                 json.dump(results, f, indent=2, ensure_ascii=False)
-
             self.logger.info(f"Results saved to: {self.output_file}")
-            print(f"\n💾 Results saved to: {self.output_file}")
-            print(
-                f"📊 Processed: {results['processing_summary']['successful_analyses']}/{results['analysis_metadata']['total_properties_processed']} properties"
-            )
-
         except Exception as e:
             self.logger.error(f"Failed to save results: {e}")
-            print(f"❌ Failed to save results: {e}")
 
     def load_json_from_url(self, url: str) -> Dict:
         """Load and parse JSON data from URL."""
         try:
-            self.logger.info(f"Fetching data from: {url}")
             response = requests.get(url, timeout=30)
             response.raise_for_status()
-
-            data = response.json()
-            self.logger.info("Successfully loaded JSON data from URL")
-            return data
-
+            return response.json()
         except Exception as e:
             self.logger.error(f"Failed to fetch data from URL: {e}")
             return {}
@@ -575,11 +581,8 @@ class PropertyImageProcessor:
     def load_json_file(self, file_path: str) -> Dict:
         """Load and parse JSON file."""
         try:
-            self.logger.info(f"Loading JSON file: {file_path}")
             with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self.logger.info("Successfully loaded JSON file")
-            return data
+                return json.load(f)
         except Exception as e:
             self.logger.error(f"Failed to load JSON file: {e}")
             return {}
@@ -593,28 +596,21 @@ async def main():
     s3_url = "https://secondbrainoldnewurls.s3.us-east-1.amazonaws.com/comparison_results_20250701_020136.json"
     data = processor.load_json_from_url(s3_url)
 
-    # Or load from file
-    # data = processor.load_json_file('paste.txt')
-
     if not data:
-        print("❌ No data found")
         return
 
     # Extract properties
     properties_dict = processor.extract_properties_from_json(data)
 
     if not properties_dict:
-        print("❌ No properties with JPEG images found")
         return
-
-    print(f"🏠 Found {len(properties_dict)} properties to process")
 
     # Process all properties (generator-based)
     results_generator = processor.process_all_properties(properties_dict)
 
-    # Save results (collects from generator) - NOW PROPERLY AWAITED
+    # Save results (collects from generator)
     await processor.save_results(results_generator, s3_url)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    trio.run(main)
