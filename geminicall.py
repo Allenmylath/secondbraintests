@@ -98,6 +98,32 @@ class PropertyImageProcessor:
         self.logger.info(f"Extracted {len(properties_dict)} properties with images")
         return properties_dict
 
+    def extract_removed_properties_mls(self, data: Dict) -> List[str]:
+        """Extract MLS numbers from removed properties."""
+        self.logger.info("Starting MLS extraction from removed properties")
+        mls_numbers = []
+        
+        if "removed_properties" not in data:
+            self.logger.info("No removed_properties section found")
+            return mls_numbers
+        
+        removed_properties = data["removed_properties"]
+        
+        for property_url, property_data in removed_properties.items():
+            if isinstance(property_data, dict) and "title" in property_data:
+                title = property_data["title"]
+                mls_number, is_genuine = self._extract_mls_number(title)
+                
+                # Only add genuine MLS numbers for removed properties
+                if is_genuine:
+                    mls_numbers.append(mls_number)
+                    self.logger.info(f"Removed property MLS: {mls_number} from {property_url[:50]}...")
+                else:
+                    self.logger.info(f"Removed property (no valid MLS): {property_url[:50]}...")
+        
+        self.logger.info(f"Extracted {len(mls_numbers)} MLS numbers from removed properties")
+        return mls_numbers
+
     def _extract_mls_number(self, title: str) -> Tuple[str, bool]:
         """Extract MLS number from title. Returns (mls_number, is_genuine)."""
         self.logger.debug(f"MLS extraction from title: '{title}'")
@@ -505,7 +531,9 @@ class PropertyImageProcessor:
             await trio.sleep(sleep_time)
 
     async def save_results(
-        self, results_generator: AsyncGenerator[Dict, None], source_url: str = None
+        self, results_generator: AsyncGenerator[Dict, None], 
+        source_url: str = None, 
+        removed_mls_list: List[str] = None
     ):
         """Collect results from generator and save to JSON file."""
         results = {
@@ -516,6 +544,10 @@ class PropertyImageProcessor:
                 "total_properties_processed": 0,
             },
             "properties": [],
+            "removed_properties": {
+                "mls_numbers": removed_mls_list or [],
+                "count": len(removed_mls_list) if removed_mls_list else 0
+            },
             "processing_summary": {
                 "successful_analyses": 0,
                 "failed_analyses": 0,
@@ -523,6 +555,7 @@ class PropertyImageProcessor:
                 "rate_limit_errors": 0,
                 "genuine_mls_count": 0,
                 "generated_mls_count": 0,
+                "removed_properties_mls_count": len(removed_mls_list) if removed_mls_list else 0,
             },
         }
 
@@ -557,9 +590,46 @@ class PropertyImageProcessor:
         genuine_count = results["processing_summary"]["genuine_mls_count"]
         generated_count = results["processing_summary"]["generated_mls_count"]
         total_count = results["analysis_metadata"]["total_properties_processed"]
+        removed_count = results["processing_summary"]["removed_properties_mls_count"]
         
         self.logger.info(f"🏷️ MLS SUMMARY: {genuine_count} genuine, {generated_count} generated out of {total_count} total properties")
+        self.logger.info(f"🗑️ REMOVED PROPERTIES: {removed_count} MLS numbers extracted")
 
+        # Save to file
+        try:
+            with open(self.output_file, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"Results saved to: {self.output_file}")
+        except Exception as e:
+            self.logger.error(f"Failed to save results: {e}")
+
+    async def save_removed_properties_only(self, removed_mls_list: List[str], source_url: str = None):
+        """Save results when only removed properties exist."""
+        results = {
+            "analysis_metadata": {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "gemini_model_used": self.gemini_model,
+                "source_data_url": source_url,
+                "total_properties_processed": 0,
+            },
+            "properties": [],
+            "removed_properties": {
+                "mls_numbers": removed_mls_list,
+                "count": len(removed_mls_list)
+            },
+            "processing_summary": {
+                "successful_analyses": 0,
+                "failed_analyses": 0,
+                "total_images_processed": 0,
+                "rate_limit_errors": 0,
+                "genuine_mls_count": 0,
+                "generated_mls_count": 0,
+                "removed_properties_mls_count": len(removed_mls_list),
+            },
+        }
+        
+        self.logger.info(f"🗑️ REMOVED PROPERTIES ONLY: {len(removed_mls_list)} MLS numbers extracted")
+        
         # Save to file
         try:
             with open(self.output_file, "w", encoding="utf-8") as f:
@@ -597,19 +667,29 @@ async def main():
     data = processor.load_json_from_url(s3_url)
 
     if not data:
+        processor.logger.error("No data loaded from URL")
         return
 
-    # Extract properties
+    # Extract current properties for analysis
     properties_dict = processor.extract_properties_from_json(data)
+    
+    # Extract MLS numbers from removed properties
+    removed_mls_list = processor.extract_removed_properties_mls(data)
 
     if not properties_dict:
+        processor.logger.warning("No current properties to process")
+        # Still save results with just removed properties if they exist
+        if removed_mls_list:
+            await processor.save_removed_properties_only(removed_mls_list, s3_url)
+        else:
+            processor.logger.warning("No properties or removed properties found")
         return
 
-    # Process all properties (generator-based)
+    # Process all current properties (generator-based)
     results_generator = processor.process_all_properties(properties_dict)
 
-    # Save results (collects from generator)
-    await processor.save_results(results_generator, s3_url)
+    # Save results (includes both processed properties and removed properties)
+    await processor.save_results(results_generator, s3_url, removed_mls_list)
 
 
 if __name__ == "__main__":
